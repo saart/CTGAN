@@ -8,18 +8,28 @@ import torch
 from packaging import version
 from torch import optim
 from torch.nn import BatchNorm1d, Dropout, LeakyReLU, Linear, Module, ReLU, Sequential, functional
+import torch_geometric
 
 from ctgan.data_sampler import DataSampler
 from ctgan.data_transformer import DataTransformer
 from ctgan.synthesizers.base import BaseSynthesizer, random_state
 
+def generate_noise(batched_graphs, batched_metadata, gcn, gcn_metadata_embedding):
+    unique_graphs = {graph.graph_index: graph for graph in batched_graphs}
+    unique_gcn = {graph.graph_index: gcn(graph.x, graph.edge_index).flatten().unsqueeze(0) for graph in
+                  unique_graphs.values()}
+    graph_embedding = torch.concatenate([unique_gcn[graph.graph_index] for graph in batched_graphs])
+    embed_to_noise = torch.cat([graph_embedding, batched_metadata],
+                               axis=1) if batched_metadata is not None else graph_embedding
+    return gcn_metadata_embedding(embed_to_noise)
 
 class Discriminator(Module):
     """Discriminator for the CTGAN."""
 
-    def __init__(self, input_dim, discriminator_dim, pac=10):
+    def __init__(self, table_embedding_dim, discriminator_dim, n_nodes, metadata_dim, noise_dim=32, pac=10):
         super(Discriminator, self).__init__()
-        dim = input_dim * pac
+        self.noise_dim = noise_dim
+        dim = (table_embedding_dim + noise_dim) * pac
         self.pac = pac
         self.pacdim = dim
         seq = []
@@ -29,8 +39,11 @@ class Discriminator(Module):
 
         seq += [Linear(dim, 1)]
         self.seq = Sequential(*seq)
+        gcn_node_embedding_size = 1
+        self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size)
+        self.gcn_metadata_embedding = torch.nn.Linear(n_nodes * gcn_node_embedding_size + metadata_dim, noise_dim)
 
-    def calc_gradient_penalty(self, real_data, fake_data, device='cpu', pac=10, lambda_=10):
+    def calc_gradient_penalty(self, real_data, fake_data, graph, metadata, device='cpu', pac=10, lambda_=10):
         """Compute the gradient penalty."""
         alpha = torch.rand(real_data.size(0) // pac, 1, 1, device=device)
         alpha = alpha.repeat(1, pac, real_data.size(1))
@@ -38,7 +51,7 @@ class Discriminator(Module):
 
         interpolates = alpha * real_data + ((1 - alpha) * fake_data)
 
-        disc_interpolates = self(interpolates)
+        disc_interpolates = self(interpolates, graph, metadata)
 
         gradients = torch.autograd.grad(
             outputs=disc_interpolates, inputs=interpolates,
@@ -46,13 +59,15 @@ class Discriminator(Module):
             create_graph=True, retain_graph=True, only_inputs=True
         )[0]
 
-        gradients_view = gradients.view(-1, pac * real_data.size(1)).norm(2, dim=1) - 1
+        gradients_view = gradients.view(-1, real_data.size(1)).norm(2, dim=1) - 1
         gradient_penalty = ((gradients_view) ** 2).mean() * lambda_
 
         return gradient_penalty
 
-    def forward(self, input_):
+    def forward(self, input_, batched_graphs, batched_metadata=None):
         """Apply the Discriminator to the `input_`."""
+        noise = generate_noise(batched_graphs, batched_metadata, self.gcn, self.gcn_metadata_embedding)
+        input_ = torch.cat([input_, noise], dim=1)
         assert input_.size()[0] % self.pac == 0
         return self.seq(input_.view(-1, self.pacdim))
 
@@ -77,18 +92,23 @@ class Residual(Module):
 class Generator(Module):
     """Generator for the CTGAN."""
 
-    def __init__(self, embedding_dim, generator_dim, data_dim):
+    def __init__(self, table_embedding_dim, generator_dim, data_dim, n_nodes, metadata_dim, noise_dim=32):
         super(Generator, self).__init__()
-        dim = embedding_dim
+        dim = table_embedding_dim + noise_dim
         seq = []
         for item in list(generator_dim):
             seq += [Residual(dim, item)]
             dim += item
         seq.append(Linear(dim, data_dim))
         self.seq = Sequential(*seq)
+        gcn_node_embedding_size = 1
+        self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size)
+        self.gcn_metadata_embedding = torch.nn.Linear(n_nodes * gcn_node_embedding_size + metadata_dim, noise_dim)
 
-    def forward(self, input_):
+    def forward(self, input_, batched_graphs, batched_metadata=None):
         """Apply the Generator to the `input_`."""
+        noise = generate_noise(batched_graphs, batched_metadata, self.gcn, self.gcn_metadata_embedding)
+        input_ = torch.cat([input_, noise], dim=1)
         data = self.seq(input_)
         return data
 
@@ -143,7 +163,8 @@ class CTGAN(BaseSynthesizer):
     def __init__(self, embedding_dim=128, generator_dim=(256, 256), discriminator_dim=(256, 256),
                  generator_lr=2e-4, generator_decay=1e-6, discriminator_lr=2e-4,
                  discriminator_decay=1e-6, batch_size=500, discriminator_steps=1,
-                 log_frequency=True, verbose=False, epochs=300, pac=10, cuda=True):
+                 log_frequency=True, verbose=False, epochs=300, pac=10, cuda=True,
+                 graph_index_to_edges=None, n_nodes=32):
 
         assert batch_size % 2 == 0
 
@@ -162,6 +183,10 @@ class CTGAN(BaseSynthesizer):
         self._verbose = verbose
         self._epochs = epochs
         self.pac = pac
+
+        self.graph_index_to_edges = graph_index_to_edges
+        self.n_nodes = n_nodes
+        self.metadata_dim = 0
 
         if not cuda or not torch.cuda.is_available():
             device = 'cpu'
@@ -278,8 +303,19 @@ class CTGAN(BaseSynthesizer):
         if invalid_columns:
             raise ValueError(f'Invalid columns found: {invalid_columns}')
 
+    def real_to_graph(self, real):
+        graph_field = self._transformer._column_transform_info_list[0]
+        batched_graph_indexes = self._transformer._inverse_transform_discrete(graph_field, real[:, :graph_field.output_dimensions])
+        batched_graphs = [self.graph_index_to_edges[graph_index] for graph_index in
+                          batched_graph_indexes]
+        graph = [torch_geometric.data.Data(x=torch.ones((self.n_nodes, 1)),
+                                           edge_index=graph, graph_index=graph_index)
+                 for graph, graph_index in zip(batched_graphs, batched_graph_indexes)]
+        return graph
+
+
     @random_state
-    def fit(self, train_data, discrete_columns=(), epochs=None):
+    def fit(self, train_data, discrete_columns=(), epochs=None, metadata=None):
         """Fit the CTGAN Synthesizer models to the training data.
 
         Args:
@@ -310,19 +346,26 @@ class CTGAN(BaseSynthesizer):
         self._data_sampler = DataSampler(
             train_data,
             self._transformer.output_info_list,
-            self._log_frequency)
+            self._log_frequency,
+            metadata=torch.Tensor(metadata) if metadata is not None else None
+        )
+        self.metadata_dim = metadata.shape[1] if metadata is not None else 0
 
         data_dim = self._transformer.output_dimensions
 
         self._generator = Generator(
-            self._embedding_dim + self._data_sampler.dim_cond_vec(),
+            self._embedding_dim,
             self._generator_dim,
-            data_dim
+            data_dim,
+            n_nodes=self.n_nodes,
+            metadata_dim=self.metadata_dim,
         ).to(self._device)
 
         discriminator = Discriminator(
-            data_dim + self._data_sampler.dim_cond_vec(),
+            data_dim,
             self._discriminator_dim,
+            n_nodes=self.n_nodes,
+            metadata_dim=self.metadata_dim,
             pac=self.pac
         ).to(self._device)
 
@@ -348,37 +391,26 @@ class CTGAN(BaseSynthesizer):
 
                     condvec = self._data_sampler.sample_condvec(self._batch_size)
                     if condvec is None:
-                        c1, m1, col, opt = None, None, None, None
-                        real = self._data_sampler.sample_data(self._batch_size, col, opt)
+                        raise ValueError('Conditional vector is required.')
                     else:
-                        c1, m1, col, opt = condvec
-                        c1 = torch.from_numpy(c1).to(self._device)
-                        m1 = torch.from_numpy(m1).to(self._device)
-                        fakez = torch.cat([fakez, c1], dim=1)
+                        _, _, col, opt = condvec
 
                         perm = np.arange(self._batch_size)
                         np.random.shuffle(perm)
-                        real = self._data_sampler.sample_data(
+                        real, metadata = self._data_sampler.sample_data(
                             self._batch_size, col[perm], opt[perm])
-                        c2 = c1[perm]
+                        graph = self.real_to_graph(real)
 
-                    fake = self._generator(fakez)
+                    fake = self._generator(fakez, graph, metadata)
                     fakeact = self._apply_activate(fake)
 
                     real = torch.from_numpy(real.astype('float32')).to(self._device)
 
-                    if c1 is not None:
-                        fake_cat = torch.cat([fakeact, c1], dim=1)
-                        real_cat = torch.cat([real, c2], dim=1)
-                    else:
-                        real_cat = real
-                        fake_cat = fakeact
-
-                    y_fake = discriminator(fake_cat)
-                    y_real = discriminator(real_cat)
+                    y_fake = discriminator(fakeact, graph, metadata)
+                    y_real = discriminator(real, graph, metadata)
 
                     pen = discriminator.calc_gradient_penalty(
-                        real_cat, fake_cat, self._device, self.pac)
+                        real, fakeact, graph, metadata, self._device, self.pac)
                     loss_d = -(torch.mean(y_real) - torch.mean(y_fake))
 
                     optimizerD.zero_grad()
@@ -390,25 +422,19 @@ class CTGAN(BaseSynthesizer):
                 condvec = self._data_sampler.sample_condvec(self._batch_size)
 
                 if condvec is None:
-                    c1, m1, col, opt = None, None, None, None
+                    raise ValueError('Conditional vector is required.')
                 else:
-                    c1, m1, col, opt = condvec
-                    c1 = torch.from_numpy(c1).to(self._device)
-                    m1 = torch.from_numpy(m1).to(self._device)
-                    fakez = torch.cat([fakez, c1], dim=1)
+                    _, _, col, opt = condvec
 
-                fake = self._generator(fakez)
+                    real, metadata = self._data_sampler.sample_data(self._batch_size, col[perm], opt[perm])
+                    graph = self.real_to_graph(real)
+
+                fake = self._generator(fakez, graph, metadata)
                 fakeact = self._apply_activate(fake)
 
-                if c1 is not None:
-                    y_fake = discriminator(torch.cat([fakeact, c1], dim=1))
-                else:
-                    y_fake = discriminator(fakeact)
+                y_fake = discriminator(fakeact, graph, metadata)
 
-                if condvec is None:
-                    cross_entropy = 0
-                else:
-                    cross_entropy = self._cond_loss(fake, c1, m1)
+                cross_entropy = 0
 
                 loss_g = -torch.mean(y_fake) + cross_entropy
 
@@ -422,7 +448,7 @@ class CTGAN(BaseSynthesizer):
                       flush=True)
 
     @random_state
-    def sample(self, n, condition_column=None, condition_value=None):
+    def sample(self, n, condition_column=None, condition_value=None, metadata=None):
         """Sample data similar to the training data.
 
         Choosing a condition_column and condition_value will increase the probability of the
@@ -440,13 +466,15 @@ class CTGAN(BaseSynthesizer):
         Returns:
             numpy.ndarray or pandas.DataFrame
         """
-        if condition_column is not None and condition_value is not None:
-            condition_info = self._transformer.convert_column_name_value_to_id(
-                condition_column, condition_value)
-            global_condition_vec = self._data_sampler.generate_cond_from_condition_column_info(
-                condition_info, self._batch_size)
+        edges = self.graph_index_to_edges[condition_value]
+        graph = [torch_geometric.data.Data(
+            x=torch.ones((self.n_nodes, 1)), edge_index=edges, graph_index=condition_value)
+            for _ in range(self._batch_size)]
+        if metadata is not None:
+            if len(metadata.shape) == 1 or metadata.shape[0] == 1:
+                metadata = metadata.repeat(len(graph), 1)
         else:
-            global_condition_vec = None
+            assert self.metadata_dim == 0, "Most provide metadata in the metadata-based CTGAN"
 
         steps = n // self._batch_size + 1
         data = []
@@ -455,19 +483,7 @@ class CTGAN(BaseSynthesizer):
             std = mean + 1
             fakez = torch.normal(mean=mean, std=std).to(self._device)
 
-            if global_condition_vec is not None:
-                condvec = global_condition_vec.copy()
-            else:
-                condvec = self._data_sampler.sample_original_condvec(self._batch_size)
-
-            if condvec is None:
-                pass
-            else:
-                c1 = condvec
-                c1 = torch.from_numpy(c1).to(self._device)
-                fakez = torch.cat([fakez, c1], dim=1)
-
-            fake = self._generator(fakez)
+            fake = self._generator(fakez, graph, metadata)
             fakeact = self._apply_activate(fake)
             data.append(fakeact.detach().cpu().numpy())
 

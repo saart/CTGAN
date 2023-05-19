@@ -6,8 +6,9 @@ import numpy as np
 class DataSampler(object):
     """DataSampler samples the conditional vector and corresponding data for CTGAN."""
 
-    def __init__(self, data, output_info, log_frequency):
+    def __init__(self, data, output_info, log_frequency, metadata=None):
         self._data = data
+        self.metadata = metadata
 
         def is_discrete_column(column_info):
             return (len(column_info) == 1
@@ -141,7 +142,9 @@ class DataSampler(object):
         for c, o in zip(col, opt):
             idx.append(np.random.choice(self._rid_by_cat_cols[c][o]))
 
-        return self._data[idx]
+        if self.metadata is not None:
+            return self._data[idx], self.metadata[idx]
+        return self._data[idx], None
 
     def dim_cond_vec(self):
         """Return the total number of categories."""

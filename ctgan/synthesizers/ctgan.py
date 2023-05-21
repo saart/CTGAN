@@ -26,7 +26,7 @@ def generate_noise(batched_graphs, batched_metadata, gcn, gcn_metadata_embedding
 class Discriminator(Module):
     """Discriminator for the CTGAN."""
 
-    def __init__(self, table_embedding_dim, discriminator_dim, n_nodes, metadata_dim, noise_dim=32, pac=10):
+    def __init__(self, table_embedding_dim, discriminator_dim, n_nodes, metadata_dim, noise_dim=128, pac=10):
         super(Discriminator, self).__init__()
         self.noise_dim = noise_dim
         dim = (table_embedding_dim + noise_dim) * pac
@@ -92,7 +92,7 @@ class Residual(Module):
 class Generator(Module):
     """Generator for the CTGAN."""
 
-    def __init__(self, table_embedding_dim, generator_dim, data_dim, n_nodes, metadata_dim, noise_dim=32):
+    def __init__(self, table_embedding_dim, generator_dim, data_dim, n_nodes, metadata_dim, noise_dim=128):
         super(Generator, self).__init__()
         dim = table_embedding_dim + noise_dim
         seq = []
@@ -304,9 +304,9 @@ class CTGAN(BaseSynthesizer):
             raise ValueError(f'Invalid columns found: {invalid_columns}')
 
     def real_to_graph(self, real):
-        graph_field = self._transformer._column_transform_info_list[0]
+        graph_field = [f for f in self._transformer._column_transform_info_list if f.column_name == 'graph-chain'][0]
         batched_graph_indexes = self._transformer._inverse_transform_discrete(graph_field, real[:, :graph_field.output_dimensions])
-        batched_graphs = [self.graph_index_to_edges[graph_index] for graph_index in
+        batched_graphs = [self.graph_index_to_edges[int(graph_index.split('-')[0])] for graph_index in
                           batched_graph_indexes]
         graph = [torch_geometric.data.Data(x=torch.ones((self.n_nodes, 1)),
                                            edge_index=graph, graph_index=graph_index)
@@ -347,7 +347,7 @@ class CTGAN(BaseSynthesizer):
             train_data,
             self._transformer.output_info_list,
             self._log_frequency,
-            metadata=torch.Tensor(metadata) if metadata is not None else None
+            metadata=torch.from_numpy(metadata.values) if metadata is not None else None
         )
         self.metadata_dim = metadata.shape[1] if metadata is not None else 0
 
@@ -466,7 +466,7 @@ class CTGAN(BaseSynthesizer):
         Returns:
             numpy.ndarray or pandas.DataFrame
         """
-        edges = self.graph_index_to_edges[condition_value]
+        edges = self.graph_index_to_edges[int(condition_value.split('-')[0])]
         graph = [torch_geometric.data.Data(
             x=torch.ones((self.n_nodes, 1)), edge_index=edges, graph_index=condition_value)
             for _ in range(self._batch_size)]

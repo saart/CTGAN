@@ -442,7 +442,6 @@ class CTGAN(BaseSynthesizer):
                         self._batch_size, col[perm], opt[perm])
                     ones = torch.ones((self.n_nodes, 1))
                     graph = [Graph(graph_index, ones, self.graph_index_to_edges[graph_index.item()]) for graph_index in graph]
-                    c2 = c1[perm]
 
                 fake = self._generator(fakez, graph, chain, metadata)
                 fakeact = self._apply_activate(fake)

@@ -404,7 +404,7 @@ class CTGAN(BaseSynthesizer):
                         real, graph, chain, metadata = self._data_sampler.sample_data(
                             self._batch_size, col[perm], opt[perm])
                         ones = torch.ones((self.n_nodes, 1))
-                        graph = [Graph(graph_index, ones, self.graph_index_to_edges[graph_index.item()]) for graph_index in graph]
+                        graph = [Graph(graph_index.item(), ones, self.graph_index_to_edges[graph_index.item()]) for graph_index in graph]
 
                         c2 = c1[perm]
 
@@ -441,7 +441,7 @@ class CTGAN(BaseSynthesizer):
                     real, graph, chain, metadata = self._data_sampler.sample_data(
                         self._batch_size, col[perm], opt[perm])
                     ones = torch.ones((self.n_nodes, 1))
-                    graph = [Graph(graph_index, ones, self.graph_index_to_edges[graph_index.item()]) for graph_index in graph]
+                    graph = [Graph(graph_index.item(), ones, self.graph_index_to_edges[graph_index.item()]) for graph_index in graph]
 
                 fake = self._generator(fakez, graph, chain, metadata)
                 fakeact = self._apply_activate(fake)
@@ -501,7 +501,7 @@ class CTGAN(BaseSynthesizer):
             fakez = torch.normal(mean=mean, std=std).to(self._device)
             fake = self._generator(fakez, graph, chain, metadata)
             fakeact = self._apply_activate(fake)
-            normalized = self._transformer.inverse_transform(fakeact.detach().cpu().numpy())
+            normalized = self._transformer.inverse_transform(fakeact.detach().cpu().numpy(), columns={"graph", "chain"})
             relevant_indexes = (normalized["graph"] == graph_index) & (normalized["chain"] == chain_index)
             filtered_normalized = normalized[relevant_indexes]
             if len(filtered_normalized) > 0:
@@ -511,7 +511,8 @@ class CTGAN(BaseSynthesizer):
                 relevant_chain = chain[relevant_indexes].repeat_interleave(self.pac, dim=0)
                 y_fake = self._discriminator(relevant_fakeact, relevant_graphs, relevant_chain, relevant_metadata).detach().cpu().numpy()
                 best_idx = np.abs(y_fake).argmin()
-                normalized_datas.append(filtered_normalized.iloc[best_idx])
+                best_row = self._transformer.inverse_transform(fakeact[best_idx:best_idx+1].detach().cpu().numpy()).iloc[0]
+                normalized_datas.append(best_row)
                 break
         return pd.DataFrame(normalized_datas)
 

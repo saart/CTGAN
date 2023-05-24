@@ -25,6 +25,7 @@ def generate_noise(batched_graphs, batched_chain, batched_metadata, gcn, metadat
     unique_gcn = {graph.graph_index: gcn(graph.x, graph.edge_index).flatten().unsqueeze(0) for graph in
                   unique_graphs.values()}
     graph_embedding = torch.concatenate([unique_gcn[graph.graph_index] for graph in batched_graphs])
+    batched_chain = batched_chain.unsqueeze(1)
     all_metadata = torch.cat([batched_chain, batched_metadata], axis=1) if batched_metadata is not None else batched_chain
     embed_to_noise = torch.cat([graph_embedding, metadata_layer(all_metadata)], axis=1)
     return gcn_metadata_embedding(embed_to_noise)
@@ -32,10 +33,10 @@ def generate_noise(batched_graphs, batched_chain, batched_metadata, gcn, metadat
 class Discriminator(Module):
     """Discriminator for the CTGAN."""
 
-    def __init__(self, table_embedding_dim, discriminator_dim, n_nodes, metadata_dim, noise_dim=128, pac=10):
+    def __init__(self, table_embedding_dim, discriminator_dim, n_nodes, metadata_dim, noise_embedding_dim=128, pac=10):
         super(Discriminator, self).__init__()
-        self.noise_dim = noise_dim
-        dim = (table_embedding_dim + noise_dim) * pac
+        self.noise_embedding_dim = noise_embedding_dim
+        dim = (table_embedding_dim + noise_embedding_dim) * pac
         self.pac = pac
         self.pacdim = dim
         seq = []
@@ -48,7 +49,7 @@ class Discriminator(Module):
         gcn_node_embedding_size = 1
         self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size)
         self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
-        self.gcn_metadata_embedding = Linear(n_nodes * gcn_node_embedding_size + 32, noise_dim)
+        self.gcn_metadata_embedding = Linear(n_nodes * gcn_node_embedding_size + 32, noise_embedding_dim)
 
     def calc_gradient_penalty(self, real_data, fake_data, graph, chain, metadata, device='cpu', pac=10, lambda_=10):
         """Compute the gradient penalty."""
@@ -99,9 +100,9 @@ class Residual(Module):
 class Generator(Module):
     """Generator for the CTGAN."""
 
-    def __init__(self, table_embedding_dim, generator_dim, data_dim, n_nodes, metadata_dim, noise_dim=128):
+    def __init__(self, table_embedding_dim, generator_dim, data_dim, n_nodes, metadata_dim, noise_embedding_dim=128):
         super(Generator, self).__init__()
-        dim = table_embedding_dim + noise_dim
+        dim = table_embedding_dim + noise_embedding_dim
         seq = []
         for item in list(generator_dim):
             seq += [Residual(dim, item)]
@@ -111,7 +112,7 @@ class Generator(Module):
         gcn_node_embedding_size = 1
         self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size)
         self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
-        self.gcn_metadata_embedding = Linear(n_nodes * gcn_node_embedding_size + 32, noise_dim)
+        self.gcn_metadata_embedding = Linear(n_nodes * gcn_node_embedding_size + 32, noise_embedding_dim)
 
     def forward(self, input_, batched_graphs, batched_chain, batched_metadata=None):
         """Apply the Generator to the `input_`."""
@@ -309,24 +310,9 @@ class CTGAN(BaseSynthesizer):
         if invalid_columns:
             raise ValueError(f'Invalid columns found: {invalid_columns}')
 
-    def real_to_graph(self, real):
-        graph_field = [f for f in self._transformer._column_transform_info_list if f.column_name == 'graph'][0]
-        batched_graph_indexes = self._transformer.inverse_transform_single(graph_field, real[:, :graph_field.output_dimensions])
-        batched_graphs = [self.graph_index_to_edges[graph_index] for graph_index in batched_graph_indexes.values.squeeze()]
-        ones = torch.ones((self.n_nodes, 1))
-        graph = [Graph(x=ones, edge_index=graph, graph_index=graph_index)
-                 for graph, graph_index in zip(batched_graphs, batched_graph_indexes.values.squeeze())]
-        return graph
-
-    def real_to_chain(self, real):
-        graph_field = [f for f in self._transformer._column_transform_info_list if f.column_name == 'graph'][0]
-        chain_field = [f for f in self._transformer._column_transform_info_list if f.column_name == 'chain'][0]
-        chain_data = real[:, graph_field.output_dimensions:graph_field.output_dimensions+chain_field.output_dimensions]
-        return torch.from_numpy(self._transformer.inverse_transform_single(chain_field, chain_data).values).type(torch.float32).reshape(real.shape[0],1).to(self._device)
-
 
     @random_state
-    def fit(self, train_data, discrete_columns=(), epochs=None, metadata=None):
+    def fit(self, train_data, graph_data, chain_data, discrete_columns=(), epochs=None, metadata=None):
         """Fit the CTGAN Synthesizer models to the training data.
 
         Args:
@@ -358,6 +344,8 @@ class CTGAN(BaseSynthesizer):
             train_data,
             self._transformer.output_info_list,
             self._log_frequency,
+            graph_data=torch.Tensor(graph_data.values),
+            chain_data=torch.Tensor(chain_data.values),
             metadata=torch.from_numpy(metadata.values).type(torch.float32) if metadata is not None else None
         )
         self.metadata_dim = metadata.shape[1] if metadata is not None else 0
@@ -413,12 +401,12 @@ class CTGAN(BaseSynthesizer):
 
                         perm = np.arange(self._batch_size)
                         np.random.shuffle(perm)
-                        real, metadata = self._data_sampler.sample_data(
+                        real, graph, chain, metadata = self._data_sampler.sample_data(
                             self._batch_size, col[perm], opt[perm])
-                        c2 = c1[perm]
+                        ones = torch.ones((self.n_nodes, 1))
+                        graph = [Graph(graph_index, ones, self.graph_index_to_edges[graph_index.item()]) for graph_index in graph]
 
-                    graph = self.real_to_graph(real)
-                    chain = self.real_to_chain(real)
+                        c2 = c1[perm]
 
                     fake = self._generator(fakez, graph, chain, metadata)
                     fakeact = self._apply_activate(fake)
@@ -450,12 +438,11 @@ class CTGAN(BaseSynthesizer):
 
                     perm = np.arange(self._batch_size)
                     np.random.shuffle(perm)
-                    real, metadata = self._data_sampler.sample_data(
+                    real, graph, chain, metadata = self._data_sampler.sample_data(
                         self._batch_size, col[perm], opt[perm])
+                    ones = torch.ones((self.n_nodes, 1))
+                    graph = [Graph(graph_index, ones, self.graph_index_to_edges[graph_index.item()]) for graph_index in graph]
                     c2 = c1[perm]
-
-                graph = self.real_to_graph(real)
-                chain = self.real_to_chain(real)
 
                 fake = self._generator(fakez, graph, chain, metadata)
                 fakeact = self._apply_activate(fake)
@@ -501,7 +488,7 @@ class CTGAN(BaseSynthesizer):
         ones = torch.ones((self.n_nodes, 1))
         graph = [Graph(x=ones, edge_index=edges, graph_index=graph_index)
             for _ in range(self._batch_size)]
-        chain = torch.tensor([chain_index for _ in range(self._batch_size)]).unsqueeze(1).type(torch.float32).to(self._device)
+        chain = torch.tensor([chain_index for _ in range(self._batch_size)]).type(torch.float32).to(self._device)
         if metadata is not None:
             if len(metadata.shape) == 1 or metadata.shape[0] == 1:
                 metadata = metadata.repeat(len(graph), 1)

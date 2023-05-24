@@ -146,17 +146,6 @@ class DataSampler(object):
             return self._data[idx], self.metadata[idx]
         return self._data[idx], None
 
-    def sample_data_all(self, n):
-        """Sample data from original training data
-
-        Returns:
-            n rows of matrix data.
-        """
-        idx = np.random.choice(len(self._data), n)
-        if self.metadata is not None:
-            return self._data[idx], self.metadata[idx]
-        return self._data[idx], None
-
     def dim_cond_vec(self):
         """Return the total number of categories."""
         return self._n_categories

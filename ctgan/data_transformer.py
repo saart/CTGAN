@@ -198,6 +198,12 @@ class DataTransformer(object):
         data = pd.DataFrame(column_data, columns=list(ohe.get_output_sdtypes()))
         return ohe.reverse_transform(data)[column_transform_info.column_name]
 
+    def inverse_transform_single(self, column_transform_info, col_data):
+        if column_transform_info.column_type == 'continuous':
+            return self._inverse_transform_continuous(column_transform_info, col_data, None, 0)
+        else:
+            return self._inverse_transform_discrete(column_transform_info, col_data)
+
     def inverse_transform(self, data, sigmas=None):
         """Take matrix data and output raw data.
 

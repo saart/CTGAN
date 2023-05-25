@@ -346,7 +346,7 @@ class CTGAN(BaseSynthesizer):
         if metadata is not None:
             self._metadata_transformer.fit(metadata, metadata_discrete_columns)
             metadata = self._metadata_transformer.transform(metadata)
-            metadata = torch.from_numpy(metadata).type(torch.float32)
+            metadata = torch.from_numpy(metadata).type(torch.float32).to(self._device)
 
         self._data_sampler = DataSampler(
             train_data,
@@ -499,7 +499,7 @@ class CTGAN(BaseSynthesizer):
         if metadata is not None:
             metadata = self._metadata_transformer.transform(metadata)
             metadata = metadata.repeat(len(graph), axis=0)
-            metadata = torch.from_numpy(metadata).type(torch.float32)
+            metadata = torch.from_numpy(metadata).type(torch.float32).to(self._device)
         else:
             assert self.metadata_dim == 0, "Most provide metadata in the metadata-based CTGAN"
 

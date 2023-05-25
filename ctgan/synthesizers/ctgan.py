@@ -352,8 +352,8 @@ class CTGAN(BaseSynthesizer):
             train_data,
             self._transformer.output_info_list,
             self._log_frequency,
-            graph_data=torch.Tensor(graph_data.values),
-            chain_data=torch.Tensor(chain_data.values),
+            graph_data=torch.Tensor(graph_data.values).to(self._device),
+            chain_data=torch.Tensor(chain_data.values).to(self._device),
             metadata=metadata
         )
         self.metadata_dim = metadata.shape[1] if metadata is not None else 0

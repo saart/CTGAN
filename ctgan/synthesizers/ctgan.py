@@ -312,7 +312,7 @@ class CTGAN(BaseSynthesizer):
 
 
     @random_state
-    def fit(self, train_data, graph_data, chain_data, discrete_columns=(), epochs=None, metadata=None):
+    def fit(self, train_data, graph_data, chain_data, discrete_columns=(), metadata_discrete_columns=(), epochs=None, metadata=None):
         """Fit the CTGAN Synthesizer models to the training data.
 
         Args:
@@ -337,8 +337,13 @@ class CTGAN(BaseSynthesizer):
 
         self._transformer = DataTransformer()
         self._transformer.fit(train_data, discrete_columns)
-
         train_data = self._transformer.transform(train_data)
+
+        self._metadata_transformer = DataTransformer()
+        if metadata is not None:
+            self._metadata_transformer.fit(metadata, metadata_discrete_columns)
+            metadata = self._metadata_transformer.transform(metadata)
+            metadata = torch.from_numpy(metadata).type(torch.float32)
 
         self._data_sampler = DataSampler(
             train_data,
@@ -346,7 +351,7 @@ class CTGAN(BaseSynthesizer):
             self._log_frequency,
             graph_data=torch.Tensor(graph_data.values),
             chain_data=torch.Tensor(chain_data.values),
-            metadata=torch.from_numpy(metadata.values).type(torch.float32) if metadata is not None else None
+            metadata=metadata
         )
         self.metadata_dim = metadata.shape[1] if metadata is not None else 0
 
@@ -489,8 +494,9 @@ class CTGAN(BaseSynthesizer):
             for _ in range(self._batch_size)]
         chain = torch.tensor([chain_index for _ in range(self._batch_size)]).type(torch.float32).to(self._device)
         if metadata is not None:
-            if len(metadata.shape) == 1 or metadata.shape[0] == 1:
-                metadata = metadata.repeat(len(graph), 1)
+            metadata = self._metadata_transformer.transform(metadata)
+            metadata = metadata.repeat(len(graph), axis=0)
+            metadata = torch.from_numpy(metadata).type(torch.float32)
         else:
             assert self.metadata_dim == 0, "Most provide metadata in the metadata-based CTGAN"
 

@@ -1,4 +1,5 @@
 """DataSampler module."""
+from collections import Counter
 
 import numpy as np
 
@@ -141,8 +142,9 @@ class DataSampler(object):
             return self._data[idx]
 
         idx = []
-        for c, o in zip(col, opt):
-            idx.append(np.random.choice(self._rid_by_cat_cols[c][o]))
+
+        for (c, o), count in Counter(zip(col, opt)).items():
+            idx.extend(np.random.choice(self._rid_by_cat_cols[c][o], count))
 
         if self.metadata is not None:
             return self._data[idx], self.graph_data[idx], self.chain_data[idx], self.metadata[idx]

@@ -211,6 +211,9 @@ class CTGAN(BaseSynthesizer):
         self._generator = None
         self._discriminator = None
 
+    def get_device(self):
+        return self._device
+
     @staticmethod
     def _gumbel_softmax(logits, tau=1, hard=False, eps=1e-10, dim=-1):
         """Deals with the instability of the gumbel_softmax for older versions of torch.
@@ -408,7 +411,7 @@ class CTGAN(BaseSynthesizer):
                         np.random.shuffle(perm)
                         real, graph, chain, metadata = self._data_sampler.sample_data(
                             self._batch_size, col[perm], opt[perm])
-                        ones = torch.ones((self.n_nodes, 1))
+                        ones = torch.ones((self.n_nodes, 1)).to(self._device)
                         graph = [Graph(graph_index.item(), ones, self.graph_index_to_edges[graph_index.item()]) for graph_index in graph]
 
                         c2 = c1[perm]
@@ -445,7 +448,7 @@ class CTGAN(BaseSynthesizer):
                     np.random.shuffle(perm)
                     real, graph, chain, metadata = self._data_sampler.sample_data(
                         self._batch_size, col[perm], opt[perm])
-                    ones = torch.ones((self.n_nodes, 1))
+                    ones = torch.ones((self.n_nodes, 1)).to(self._device)
                     graph = [Graph(graph_index.item(), ones, self.graph_index_to_edges[graph_index.item()]) for graph_index in graph]
 
                 fake = self._generator(fakez, graph, chain, metadata)
@@ -489,7 +492,7 @@ class CTGAN(BaseSynthesizer):
             numpy.ndarray or pandas.DataFrame
         """
         edges = self.graph_index_to_edges[graph_index]
-        ones = torch.ones((self.n_nodes, 1))
+        ones = torch.ones((self.n_nodes, 1)).to(self._device)
         graph = [Graph(x=ones, edge_index=edges, graph_index=graph_index)
             for _ in range(self._batch_size)]
         chain = torch.tensor([chain_index for _ in range(self._batch_size)]).type(torch.float32).to(self._device)

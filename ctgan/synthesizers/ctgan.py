@@ -8,7 +8,7 @@ import torch
 from torch import optim
 from torch.nn import BatchNorm1d, Dropout, LeakyReLU, Linear, Module, ReLU, Sequential, functional
 import torch_geometric
-import wandb
+# import wandb
 
 from ctgan.data_sampler import DataSampler
 from ctgan.data_transformer import DataTransformer
@@ -47,7 +47,7 @@ class Discriminator(Module):
         seq += [Linear(dim, 1)]
         self.seq = Sequential(*seq)
         gcn_node_embedding_size = 1
-        self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size)
+        self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size, cached=True)
         self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
         self.gcn_metadata_embedding = Linear(n_nodes * gcn_node_embedding_size + 32, noise_embedding_dim)
 
@@ -110,7 +110,7 @@ class Generator(Module):
         seq.append(Linear(dim, data_dim))
         self.seq = Sequential(*seq)
         gcn_node_embedding_size = 1
-        self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size)
+        self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size, cached=True)
         self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
         self.gcn_metadata_embedding = Linear(n_nodes * gcn_node_embedding_size + 32, noise_embedding_dim)
 
@@ -367,7 +367,7 @@ class CTGAN(BaseSynthesizer):
             n_nodes=self.n_nodes,
             metadata_dim=self.metadata_dim,
         ).to(self._device)
-        wandb.watch(self._generator)
+        # wandb.watch(self._generator)
 
         self._discriminator = Discriminator(
             data_dim,
@@ -376,7 +376,7 @@ class CTGAN(BaseSynthesizer):
             metadata_dim=self.metadata_dim,
             pac=self.pac
         ).to(self._device)
-        wandb.watch(self._discriminator)
+        # wandb.watch(self._discriminator)
 
         optimizerG = optim.Adam(
             self._generator.parameters(), lr=self._generator_lr, betas=(0.5, 0.9),

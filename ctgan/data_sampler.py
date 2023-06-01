@@ -146,9 +146,9 @@ class DataSampler(object):
         for (c, o), count in Counter(zip(col, opt)).items():
             idx.extend(np.random.choice(self._rid_by_cat_cols[c][o], count))
 
-        if self.metadata is not None:
-            return self._data[idx], self.graph_data[idx], self.chain_data[idx], self.metadata[idx]
-        return self._data[idx], self.graph_data[idx], self.chain_data[idx], None
+        metadata = self.metadata[idx] if self.metadata is not None else None
+        chain_data = self.chain_data[idx] if self.chain_data is not None else None
+        return self._data[idx], self.graph_data[idx], chain_data, metadata
 
     def dim_cond_vec(self):
         """Return the total number of categories."""

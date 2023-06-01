@@ -1,7 +1,7 @@
 """CTGAN module."""
 
 import warnings
-from typing import NamedTuple
+from typing import NamedTuple, Union
 import numpy as np
 import pandas as pd
 import torch
@@ -15,7 +15,7 @@ from ctgan.data_transformer import DataTransformer
 from ctgan.synthesizers.base import BaseSynthesizer, random_state
 
 class Graph(NamedTuple):
-    graph_index: int
+    graph_index: Union[int, str]
     x: torch.Tensor
     edge_index: torch.Tensor
 
@@ -173,7 +173,7 @@ class CTGAN(BaseSynthesizer):
                  generator_lr=2e-4, generator_decay=1e-6, discriminator_lr=2e-4,
                  discriminator_decay=1e-6, batch_size=500, discriminator_steps=1,
                  log_frequency=True, verbose=False, epochs=300, pac=10, cuda=True,
-                 graph_index_to_edges=None, n_nodes=32):
+                 graph_index_to_edges=None, n_nodes=32, functional_loss=None, functional_loss_freq=None):
 
         assert batch_size % 2 == 0
 
@@ -193,6 +193,8 @@ class CTGAN(BaseSynthesizer):
         self._epochs = epochs
         self.pac = pac
 
+        self.functional_loss = functional_loss
+        self.functional_loss_freq = functional_loss_freq
         self.graph_index_to_edges = graph_index_to_edges
         self.n_nodes = n_nodes
         self.metadata_dim = 0
@@ -204,6 +206,7 @@ class CTGAN(BaseSynthesizer):
         else:
             device = 'cuda'
 
+        print(f"Using device: {device}")
         self._device = torch.device(device)
 
         self._transformer = None
@@ -472,8 +475,11 @@ class CTGAN(BaseSynthesizer):
                       f'Loss D: {loss_d.detach().cpu(): .4f}',
                       flush=True)
 
+            if self.functional_loss_freq and self.functional_loss and (i+1) % self.functional_loss_freq == 0:
+                self.functional_loss(i)
+
     @random_state
-    def sample(self, n, graph_index, chain_index, metadata=None):
+    def sample(self, n, graph_index, chain_index, metadata=None, should_pick_best=True):
         """Sample data similar to the training data.
 
         Choosing a condition_column and condition_value will increase the probability of the
@@ -495,7 +501,7 @@ class CTGAN(BaseSynthesizer):
         ones = torch.ones((self.n_nodes, 1)).to(self._device)
         graph = [Graph(x=ones, edge_index=edges, graph_index=graph_index)
             for _ in range(self._batch_size)]
-        chain = torch.tensor([chain_index for _ in range(self._batch_size)]).type(torch.float32).to(self._device)
+        chain = torch.tensor([(chain_index or 0) for _ in range(self._batch_size)]).type(torch.float32).to(self._device)
         if metadata is not None:
             metadata = self._metadata_transformer.transform(metadata)
             metadata = metadata.repeat(len(graph), axis=0)
@@ -511,9 +517,14 @@ class CTGAN(BaseSynthesizer):
             fake = self._generator(fakez, graph, chain, metadata)
             fakeact = self._apply_activate(fake)
             normalized = self._transformer.inverse_transform(fakeact.detach().cpu().numpy(), columns={"graph", "chain"})
-            relevant_indexes = (normalized["graph"] == graph_index) & (normalized["chain"] == chain_index)
+            relevant_indexes = (normalized["graph"] == graph_index)
+            if chain_index is not None:
+                relevant_indexes &= (normalized["chain"] == chain_index)
             filtered_normalized = normalized[relevant_indexes]
             if len(filtered_normalized) > 0:
+                if not should_pick_best:
+                    normalized_datas.extend(self._transformer.inverse_transform(fakeact[relevant_indexes].detach().cpu().numpy()).iloc)
+                    break
                 relevant_metadata = metadata[relevant_indexes].repeat_interleave(self.pac, dim=0) if metadata is not None else None
                 relevant_graphs = [g for should, g in zip(relevant_indexes, graph) for i in range(self.pac) if should]
                 relevant_fakeact = fakeact[relevant_indexes].repeat_interleave(self.pac, dim=0)

@@ -20,11 +20,17 @@ class Graph(NamedTuple):
     edge_index: torch.Tensor
 
 
-def generate_noise(batched_graphs, batched_chain, batched_metadata, gcn, metadata_layer, gcn_metadata_embedding):
-    unique_graphs = {graph.graph_index: graph for graph in batched_graphs}
-    unique_gcn = {graph.graph_index: gcn(graph.x, graph.edge_index).flatten().unsqueeze(0) for graph in
-                  unique_graphs.values()}
-    graph_embedding = torch.concatenate([unique_gcn[graph.graph_index] for graph in batched_graphs])
+def generate_noise(batched_graphs, batched_chain, batched_metadata, gcn, metadata_layer, gcn_metadata_embedding, with_gcn, graph_dim):
+    if with_gcn:
+        unique_graphs = {graph.graph_index: graph for graph in batched_graphs}
+        unique_gcn = {graph.graph_index: gcn(graph.x, graph.edge_index).flatten().unsqueeze(0) for graph in
+                      unique_graphs.values()}
+        graph_embedding = torch.concatenate([unique_gcn[graph.graph_index] for graph in batched_graphs])
+    else:
+        graph_embedding = torch.zeros((len(batched_graphs), graph_dim))
+        for row_index, graph in enumerate(batched_graphs):
+            graph_embedding[row_index][int(graph.graph_index)] = 1
+
     batched_chain = batched_chain.unsqueeze(1)
     all_metadata = torch.cat([batched_chain, batched_metadata], axis=1) if batched_metadata is not None else batched_chain
     embed_to_noise = torch.cat([graph_embedding, metadata_layer(all_metadata)], axis=1)
@@ -33,7 +39,7 @@ def generate_noise(batched_graphs, batched_chain, batched_metadata, gcn, metadat
 class Discriminator(Module):
     """Discriminator for the CTGAN."""
 
-    def __init__(self, table_embedding_dim, discriminator_dim, n_nodes, metadata_dim, noise_embedding_dim=128, pac=10):
+    def __init__(self, table_embedding_dim, discriminator_dim, n_nodes, metadata_dim, graph_dim: int, with_gcn: bool, noise_embedding_dim=128, pac=10):
         super(Discriminator, self).__init__()
         self.noise_embedding_dim = noise_embedding_dim
         dim = (table_embedding_dim + noise_embedding_dim) * pac
@@ -49,7 +55,12 @@ class Discriminator(Module):
         gcn_node_embedding_size = 1
         self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size, cached=True)
         self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
-        self.gcn_metadata_embedding = Linear(n_nodes * gcn_node_embedding_size + 32, noise_embedding_dim)
+        self.with_gcn = with_gcn
+        if self.with_gcn:
+            self.graph_dim = n_nodes * gcn_node_embedding_size
+        else:
+            self.graph_dim = graph_dim
+        self.gcn_metadata_embedding = Linear(self.graph_dim + 32, noise_embedding_dim)
 
     def calc_gradient_penalty(self, real_data, fake_data, graph, chain, metadata, device='cpu', pac=10, lambda_=10):
         """Compute the gradient penalty."""
@@ -74,7 +85,12 @@ class Discriminator(Module):
 
     def forward(self, input_, batched_graphs, batched_chain, batched_metadata=None):
         """Apply the Discriminator to the `input_`."""
-        noise = generate_noise(batched_graphs, batched_chain, batched_metadata, self.gcn, self.metadata_layer, self.gcn_metadata_embedding)
+        noise = generate_noise(
+            batched_graphs=batched_graphs, batched_chain=batched_chain,
+            batched_metadata=batched_metadata, gcn=self.gcn, metadata_layer=self.metadata_layer,
+            gcn_metadata_embedding=self.gcn_metadata_embedding, with_gcn=self.with_gcn,
+            graph_dim=self.graph_dim
+        )
         input_ = torch.cat([input_, noise], dim=1)
         assert input_.size()[0] % self.pac == 0
         return self.seq(input_.view(-1, self.pacdim))
@@ -100,7 +116,7 @@ class Residual(Module):
 class Generator(Module):
     """Generator for the CTGAN."""
 
-    def __init__(self, table_embedding_dim, generator_dim, data_dim, n_nodes, metadata_dim, noise_embedding_dim=128):
+    def __init__(self, table_embedding_dim, generator_dim, data_dim, n_nodes, metadata_dim, graph_dim: int, with_gcn: bool, noise_embedding_dim=128):
         super(Generator, self).__init__()
         dim = table_embedding_dim + noise_embedding_dim
         seq = []
@@ -112,11 +128,21 @@ class Generator(Module):
         gcn_node_embedding_size = 1
         self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size, cached=True)
         self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
-        self.gcn_metadata_embedding = Linear(n_nodes * gcn_node_embedding_size + 32, noise_embedding_dim)
+        self.with_gcn = with_gcn
+        if self.with_gcn:
+            self.graph_dim = n_nodes * gcn_node_embedding_size
+        else:
+            self.graph_dim = graph_dim
+        self.gcn_metadata_embedding = Linear(self.graph_dim + 32, noise_embedding_dim)
 
     def forward(self, input_, batched_graphs, batched_chain, batched_metadata=None):
         """Apply the Generator to the `input_`."""
-        noise = generate_noise(batched_graphs, batched_chain, batched_metadata, self.gcn, self.metadata_layer, self.gcn_metadata_embedding)
+        noise = generate_noise(
+            batched_graphs=batched_graphs, batched_chain=batched_chain,
+            batched_metadata=batched_metadata, gcn=self.gcn, metadata_layer=self.metadata_layer,
+            gcn_metadata_embedding=self.gcn_metadata_embedding, with_gcn=self.with_gcn,
+            graph_dim=self.graph_dim
+        )
         input_ = torch.cat([input_, noise], dim=1)
         data = self.seq(input_)
         return data
@@ -173,7 +199,7 @@ class CTGAN(BaseSynthesizer):
                  generator_lr=2e-4, generator_decay=1e-6, discriminator_lr=2e-4,
                  discriminator_decay=1e-6, batch_size=500, discriminator_steps=1,
                  log_frequency=True, verbose=False, epochs=300, pac=10, cuda=True,
-                 graph_index_to_edges=None, n_nodes=32, functional_loss=None, functional_loss_freq=None):
+                 graph_index_to_edges=None, n_nodes=32, functional_loss=None, functional_loss_freq=None, with_gcn=True):
 
         assert batch_size % 2 == 0
 
@@ -198,6 +224,7 @@ class CTGAN(BaseSynthesizer):
         self.graph_index_to_edges = graph_index_to_edges
         self.n_nodes = n_nodes
         self.metadata_dim = 0
+        self.with_gcn = with_gcn
 
         if not cuda or not torch.cuda.is_available():
             device = 'cpu'
@@ -369,6 +396,8 @@ class CTGAN(BaseSynthesizer):
             data_dim,
             n_nodes=self.n_nodes,
             metadata_dim=self.metadata_dim,
+            graph_dim=len(graph_data.unique()),
+            with_gcn=self.with_gcn,
         ).to(self._device)
         # wandb.watch(self._generator)
 
@@ -377,7 +406,9 @@ class CTGAN(BaseSynthesizer):
             self._discriminator_dim,
             n_nodes=self.n_nodes,
             metadata_dim=self.metadata_dim,
-            pac=self.pac
+            graph_dim=len(graph_data.unique()),
+            pac=self.pac,
+            with_gcn=self.with_gcn,
         ).to(self._device)
         # wandb.watch(self._discriminator)
 

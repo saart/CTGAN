@@ -27,7 +27,7 @@ def generate_noise(batched_graphs, batched_chain, batched_metadata, gcn, metadat
                       unique_graphs.values()}
         graph_embedding = torch.concatenate([unique_gcn[graph.graph_index] for graph in batched_graphs])
     else:
-        graph_embedding = torch.zeros((len(batched_graphs), graph_dim))
+        graph_embedding = torch.zeros((len(batched_graphs), graph_dim))  # TODO: .to(device)
         for row_index, graph in enumerate(batched_graphs):
             graph_embedding[row_index][int(graph.graph_index)] = 1
 
@@ -199,7 +199,8 @@ class CTGAN(BaseSynthesizer):
                  generator_lr=2e-4, generator_decay=1e-6, discriminator_lr=2e-4,
                  discriminator_decay=1e-6, batch_size=500, discriminator_steps=1,
                  log_frequency=True, verbose=False, epochs=300, pac=10, cuda=True,
-                 graph_index_to_edges=None, n_nodes=32, functional_loss=None, functional_loss_freq=None, with_gcn=True):
+                 graph_index_to_edges=None, n_nodes=32, functional_loss=None,
+                 functional_loss_freq=None, with_gcn=True, device: torch.device = None):
 
         assert batch_size % 2 == 0
 
@@ -226,15 +227,18 @@ class CTGAN(BaseSynthesizer):
         self.metadata_dim = 0
         self.with_gcn = with_gcn
 
-        if not cuda or not torch.cuda.is_available():
-            device = 'cpu'
-        elif isinstance(cuda, str):
-            device = cuda
+        if device:
+            self._device = device
         else:
-            device = 'cuda'
+            if not cuda or not torch.cuda.is_available():
+                device = 'cpu'
+            elif isinstance(cuda, str):
+                device = cuda
+            else:
+                device = 'cuda'
 
-        print(f"Using device: {device}")
-        self._device = torch.device(device)
+            print(f"Using device: {device}")
+            self._device = torch.device(device)
 
         self._transformer = None
         self._data_sampler = None
@@ -396,7 +400,7 @@ class CTGAN(BaseSynthesizer):
             data_dim,
             n_nodes=self.n_nodes,
             metadata_dim=self.metadata_dim,
-            graph_dim=len(graph_data.unique()),
+            graph_dim=graph_data.max() + 1,
             with_gcn=self.with_gcn,
         ).to(self._device)
         # wandb.watch(self._generator)
@@ -406,7 +410,7 @@ class CTGAN(BaseSynthesizer):
             self._discriminator_dim,
             n_nodes=self.n_nodes,
             metadata_dim=self.metadata_dim,
-            graph_dim=len(graph_data.unique()),
+            graph_dim=graph_data.max() + 1,
             pac=self.pac,
             with_gcn=self.with_gcn,
         ).to(self._device)

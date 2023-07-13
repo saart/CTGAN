@@ -249,7 +249,7 @@ class CTGAN(BaseSynthesizer):
         return self._device
 
     @staticmethod
-    def _gumbel_softmax(logits, tau=1, hard=False, eps=1e-10, dim=-1):
+    def _gumbel_softmax(logits, tau=1., hard=False, eps=1e-10, dim=-1):
         """Deals with the instability of the gumbel_softmax for older versions of torch.
 
         For more details about the issue:
@@ -415,7 +415,56 @@ class CTGAN(BaseSynthesizer):
             with_gcn=self.with_gcn,
         ).to(self._device)
         # wandb.watch(self._discriminator)
+        self._fit_for(train_data, epochs)
 
+    def gen_generator_rand_data(self, mean, std):
+        fakez = torch.normal(mean=mean, std=std)
+
+        condvec = self._data_sampler.sample_condvec(self._batch_size)
+        if condvec is None:
+            c1, m1, col, opt = None, None, None, None
+            real = self._data_sampler.sample_data(self._batch_size, col, opt)
+            chain, metadata, graph = None, None, None
+        else:
+            c1, m1, col, opt = condvec
+            c1 = torch.from_numpy(c1).to(self._device)
+            m1 = torch.from_numpy(m1).to(self._device)
+
+            perm = np.arange(self._batch_size)
+            np.random.shuffle(perm)
+            real, graph, chain, metadata = self._data_sampler.sample_data(
+                self._batch_size, col[perm], opt[perm])
+            ones = torch.ones((self.n_nodes, 1)).to(self._device)
+            graph = [Graph(graph_index.item(), ones, self.graph_index_to_edges[graph_index.item()])
+                     for graph_index in graph]
+
+            c2 = c1[perm]
+
+        return fakez, condvec, real, graph, chain, metadata
+
+    def get_discriminator_rand_data(self, mean, std):
+        fakez = torch.normal(mean=mean, std=std)
+
+        condvec = self._data_sampler.sample_condvec(self._batch_size)
+        if condvec is None:
+            c1, m1, col, opt = None, None, None, None
+            real = self._data_sampler.sample_data(self._batch_size, col, opt)
+            chain, metadata, graph = None, None, None
+        else:
+            c1, m1, col, opt = condvec
+            c1 = torch.from_numpy(c1).to(self._device)
+            m1 = torch.from_numpy(m1).to(self._device)
+
+            perm = np.arange(self._batch_size)
+            np.random.shuffle(perm)
+            real, graph, chain, metadata = self._data_sampler.sample_data(
+                self._batch_size, col[perm], opt[perm])
+            ones = torch.ones((self.n_nodes, 1)).to(self._device)
+            graph = [Graph(graph_index.item(), ones, self.graph_index_to_edges[graph_index.item()])
+                     for graph_index in graph]
+        return fakez, condvec, real, graph, chain, metadata, c1, m1
+
+    def _fit_for(self, train_data, epochs):
         optimizerG = optim.Adam(
             self._generator.parameters(), lr=self._generator_lr, betas=(0.5, 0.9),
             weight_decay=self._generator_decay
@@ -430,29 +479,12 @@ class CTGAN(BaseSynthesizer):
         std = mean + 1
 
         steps_per_epoch = max(len(train_data) // self._batch_size, 1)
+        loss_g, loss_d = None, None
         for i in range(epochs):
             for id_ in range(steps_per_epoch):
 
                 for n in range(self._discriminator_steps):
-                    fakez = torch.normal(mean=mean, std=std)
-
-                    condvec = self._data_sampler.sample_condvec(self._batch_size)
-                    if condvec is None:
-                        c1, m1, col, opt = None, None, None, None
-                        real = self._data_sampler.sample_data(self._batch_size, col, opt)
-                    else:
-                        c1, m1, col, opt = condvec
-                        c1 = torch.from_numpy(c1).to(self._device)
-                        m1 = torch.from_numpy(m1).to(self._device)
-
-                        perm = np.arange(self._batch_size)
-                        np.random.shuffle(perm)
-                        real, graph, chain, metadata = self._data_sampler.sample_data(
-                            self._batch_size, col[perm], opt[perm])
-                        ones = torch.ones((self.n_nodes, 1)).to(self._device)
-                        graph = [Graph(graph_index.item(), ones, self.graph_index_to_edges[graph_index.item()]) for graph_index in graph]
-
-                        c2 = c1[perm]
+                    fakez, condvec, real, graph, chain, metadata = self.gen_generator_rand_data(mean, std)
 
                     fake = self._generator(fakez, graph, chain, metadata)
                     fakeact = self._apply_activate(fake)
@@ -471,23 +503,7 @@ class CTGAN(BaseSynthesizer):
                     loss_d.backward()
                     optimizerD.step()
 
-                fakez = torch.normal(mean=mean, std=std)
-
-                condvec = self._data_sampler.sample_condvec(self._batch_size)
-                if condvec is None:
-                    c1, m1, col, opt = None, None, None, None
-                    real = self._data_sampler.sample_data(self._batch_size, col, opt)
-                else:
-                    c1, m1, col, opt = condvec
-                    c1 = torch.from_numpy(c1).to(self._device)
-                    m1 = torch.from_numpy(m1).to(self._device)
-
-                    perm = np.arange(self._batch_size)
-                    np.random.shuffle(perm)
-                    real, graph, chain, metadata = self._data_sampler.sample_data(
-                        self._batch_size, col[perm], opt[perm])
-                    ones = torch.ones((self.n_nodes, 1)).to(self._device)
-                    graph = [Graph(graph_index.item(), ones, self.graph_index_to_edges[graph_index.item()]) for graph_index in graph]
+                fakez, condvec, real, graph, chain, metadata, c1, m1 = self.get_discriminator_rand_data(mean, std)
 
                 fake = self._generator(fakez, graph, chain, metadata)
                 fakeact = self._apply_activate(fake)
@@ -520,23 +536,14 @@ class CTGAN(BaseSynthesizer):
         Choosing a condition_column and condition_value will increase the probability of the
         discrete condition_value happening in the condition_column.
 
-        Args:
-            n (int):
-                Number of rows to sample.
-            condition_column (string):
-                Name of a discrete column.
-            condition_value (string):
-                Name of the category in the condition_column which we wish to increase the
-                probability of happening.
-
         Returns:
             numpy.ndarray or pandas.DataFrame
         """
+        n = n or self._batch_size
         edges = self.graph_index_to_edges[graph_index]
         ones = torch.ones((self.n_nodes, 1)).to(self._device)
-        graph = [Graph(x=ones, edge_index=edges, graph_index=graph_index)
-            for _ in range(self._batch_size)]
-        chain = torch.tensor([(chain_index or 0) for _ in range(self._batch_size)]).type(torch.float32).to(self._device)
+        graph = [Graph(x=ones, edge_index=edges, graph_index=graph_index) for _ in range(n)]
+        chain = torch.tensor([(chain_index or 0) for _ in range(n)]).type(torch.float32).to(self._device)
         if metadata is not None:
             metadata = self._metadata_transformer.transform(metadata)
             metadata = metadata.repeat(len(graph), axis=0)
@@ -544,32 +551,29 @@ class CTGAN(BaseSynthesizer):
         else:
             assert self.metadata_dim == 0, "Most provide metadata in the metadata-based CTGAN"
 
-        normalized_datas = []
-        mean = torch.zeros(self._batch_size, self._embedding_dim)
+        mean = torch.zeros(n, self._embedding_dim)
         std = mean + 1
         for _ in range(10):
             fakez = torch.normal(mean=mean, std=std).to(self._device)
             fake = self._generator(fakez, graph, chain, metadata)
             fakeact = self._apply_activate(fake)
+            if not should_pick_best:
+                break
             normalized = self._transformer.inverse_transform(fakeact.detach().cpu().numpy(), columns={"graph", "chain"})
             relevant_indexes = (normalized["graph"] == graph_index)
             if chain_index is not None:
                 relevant_indexes &= (normalized["chain"] == chain_index)
             filtered_normalized = normalized[relevant_indexes]
             if len(filtered_normalized) > 0:
-                if not should_pick_best:
-                    normalized_datas.extend(self._transformer.inverse_transform(fakeact[relevant_indexes].detach().cpu().numpy()).iloc)
-                    break
                 relevant_metadata = metadata[relevant_indexes].repeat_interleave(self.pac, dim=0) if metadata is not None else None
                 relevant_graphs = [g for should, g in zip(relevant_indexes, graph) for i in range(self.pac) if should]
                 relevant_fakeact = fakeact[relevant_indexes].repeat_interleave(self.pac, dim=0)
                 relevant_chain = chain[relevant_indexes].repeat_interleave(self.pac, dim=0)
                 y_fake = self._discriminator(relevant_fakeact, relevant_graphs, relevant_chain, relevant_metadata).detach().cpu().numpy()
                 best_idx = np.abs(y_fake).argmin()
-                best_row = self._transformer.inverse_transform(fakeact[best_idx:best_idx+1].detach().cpu().numpy()).iloc[0]
-                normalized_datas.append(best_row)
+                fakeact = relevant_fakeact[best_idx:best_idx+1]
                 break
-        return pd.DataFrame(normalized_datas)
+        return self._transformer.inverse_transform(fakeact.detach().cpu().numpy())
 
     def set_device(self, device):
         """Set the `device` to be used ('GPU' or 'CPU)."""

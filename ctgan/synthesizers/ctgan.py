@@ -14,6 +14,7 @@ from ctgan.data_sampler import DataSampler
 from ctgan.data_transformer import DataTransformer
 from ctgan.synthesizers.base import BaseSynthesizer, random_state
 
+
 class Graph(NamedTuple):
     graph_index: Union[int, str]
     x: torch.Tensor
@@ -239,6 +240,7 @@ class CTGAN(BaseSynthesizer):
 
             print(f"Using device: {device}")
             self._device = torch.device(device)
+        print(f"Use device: {self._device}")
 
         self._transformer = None
         self._data_sampler = None
@@ -540,7 +542,7 @@ class CTGAN(BaseSynthesizer):
             numpy.ndarray or pandas.DataFrame
         """
         n = n or self._batch_size
-        edges = self.graph_index_to_edges[graph_index]
+        edges = self.graph_index_to_edges[graph_index].to(self._device)
         ones = torch.ones((self.n_nodes, 1)).to(self._device)
         graph = [Graph(x=ones, edge_index=edges, graph_index=graph_index) for _ in range(n)]
         chain = torch.tensor([(chain_index or 0) for _ in range(n)]).type(torch.float32).to(self._device)

@@ -30,20 +30,25 @@ class Noise(Module):
         noise_embedding_dim=128
     ):
         super().__init__()
+        # Config
         self.noise_embedding_dim = noise_embedding_dim
-        gcn_node_embedding_size = 1
-        self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size, cached=True)
-        self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
-        self.timestamp_layer = Linear(1, 1)
         self.with_gcn = with_gcn
         self.n_nodes = n_nodes
         self.device = device
         self.graph_index_to_edges = graph_index_to_edges
+        gcn_node_embedding_size = 1
         if self.with_gcn:
             self.graph_dim = n_nodes * gcn_node_embedding_size
         else:
             self.graph_dim = graph_dim
+
+        # Layers
+        self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size, cached=True)
+        self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
+        self.timestamp_layer = Linear(1, 1)
         self.gcn_metadata_embedding = Linear(self.graph_dim + 32, noise_embedding_dim)
+
+        # Data
         self.graph_data = graph_data
         self.chain_data = chain_data
         self.metadata = metadata

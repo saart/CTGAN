@@ -1,7 +1,7 @@
 """CTGAN module."""
 
 import warnings
-from typing import NamedTuple, Union, Optional
+from typing import NamedTuple, Union, Optional, List
 import numpy as np
 import pandas as pd
 import torch
@@ -21,31 +21,89 @@ class Graph(NamedTuple):
     edge_index: torch.Tensor
 
 
-def generate_noise(batched_graphs, batched_chain, batched_metadata, gcn, metadata_layer,
-                   timestamp_layer, gcn_metadata_embedding, with_gcn, graph_dim):
-    if with_gcn:
-        unique_graphs = {graph.graph_index: graph for graph in batched_graphs}
-        unique_gcn = {graph.graph_index: gcn(graph.x, graph.edge_index).flatten().unsqueeze(0) for graph in
-                      unique_graphs.values()}
-        graph_embedding = torch.concatenate([unique_gcn[graph.graph_index] for graph in batched_graphs])
-    else:
-        graph_embedding = torch.zeros((len(batched_graphs), graph_dim))
-        for row_index, graph in enumerate(batched_graphs):
-            graph_embedding[row_index][int(graph.graph_index)] = 1
+class Noise(Module):
+    def __init__(
+        self, metadata_dim, with_gcn, n_nodes, graph_dim, device, graph_index_to_edges,
+        graph_data: Optional[torch.Tensor] = None,
+        chain_data: Optional[torch.Tensor] = None,
+        metadata: Optional[torch.Tensor] = None,
+        noise_embedding_dim=128
+    ):
+        super().__init__()
+        self.noise_embedding_dim = noise_embedding_dim
+        gcn_node_embedding_size = 1
+        self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size, cached=True)
+        self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
+        self.timestamp_layer = Linear(1, 1)
+        self.with_gcn = with_gcn
+        self.n_nodes = n_nodes
+        self.device = device
+        self.graph_index_to_edges = graph_index_to_edges
+        if self.with_gcn:
+            self.graph_dim = n_nodes * gcn_node_embedding_size
+        else:
+            self.graph_dim = graph_dim
+        self.gcn_metadata_embedding = Linear(self.graph_dim + 32, noise_embedding_dim)
+        self.graph_data = graph_data
+        self.chain_data = chain_data
+        self.metadata = metadata
 
-    batched_chain = batched_chain.unsqueeze(1)
-    all_metadata = torch.cat([batched_chain, batched_metadata], axis=1) if batched_metadata is not None else batched_chain
-    embed_to_noise = torch.cat([graph_embedding, metadata_layer(all_metadata)], axis=1)
-    return gcn_metadata_embedding(embed_to_noise)
+    def get_dim(self) -> int:
+        return self.noise_embedding_dim
+
+    def forward(self, input_):
+        """Apply the Discriminator to the `input_`."""
+        assert input_.size()[0] % self.pac == 0
+        return self.seq(input_.view(-1, self.pacdim))
+
+    def generate_noise_from_indexes(self, idx: List[int]):
+        chain = self.chain_data[idx]
+        metadata = None if self.metadata is None else self.metadata[idx]
+        graph = None if self.graph_data is None else self.graph_data[idx]
+
+        ones = torch.ones((self.n_nodes, 1)).to(self.device)
+        graph = [Graph(graph_index.item(), ones, self.graph_index_to_edges[graph_index.item()])
+                 for graph_index in graph]
+
+        # TODO: Do we want to use the same layers for generator and discriminator?
+        return self.generate_noise_from_metadata(
+            batched_graphs=graph, batched_chain=chain, batched_metadata=metadata
+        )
+
+    def generate_noise_from_metadata(self, batched_metadata, batched_chain, batched_graphs):
+        return self.generate_noise(
+            batched_graphs=batched_graphs, batched_chain=batched_chain,
+            batched_metadata=batched_metadata, gcn=self.gcn,
+            metadata_layer=self.metadata_layer, timestamp_layer=self.timestamp_layer,
+            gcn_metadata_embedding=self.gcn_metadata_embedding, with_gcn=self.with_gcn,
+            graph_dim=self.graph_dim
+        )
+
+    @staticmethod
+    def generate_noise(batched_graphs, batched_chain, batched_metadata, gcn, metadata_layer,
+                       timestamp_layer, gcn_metadata_embedding, with_gcn, graph_dim):
+        if with_gcn:
+            unique_graphs = {graph.graph_index: graph for graph in batched_graphs}
+            unique_gcn = {graph.graph_index: gcn(graph.x, graph.edge_index).flatten().unsqueeze(0) for graph in
+                          unique_graphs.values()}
+            graph_embedding = torch.concatenate([unique_gcn[graph.graph_index] for graph in batched_graphs])
+        else:
+            graph_embedding = torch.zeros((len(batched_graphs), graph_dim))
+            for row_index, graph in enumerate(batched_graphs):
+                graph_embedding[row_index][int(graph.graph_index)] = 1
+
+        batched_chain = batched_chain.unsqueeze(1)
+        all_metadata = torch.cat([batched_chain, batched_metadata], dim=1) if batched_metadata is not None else batched_chain
+        embed_to_noise = torch.cat([graph_embedding, metadata_layer(all_metadata)], dim=1)
+        return gcn_metadata_embedding(embed_to_noise)
 
 
 class Discriminator(Module):
     """Discriminator for the CTGAN."""
 
-    def __init__(self, table_embedding_dim, discriminator_dim, n_nodes, metadata_dim, graph_dim: int, with_gcn: bool, noise_embedding_dim=128, pac=10):
+    def __init__(self, input_dim, discriminator_dim, pac=10):
         super(Discriminator, self).__init__()
-        self.noise_embedding_dim = noise_embedding_dim
-        dim = (table_embedding_dim + noise_embedding_dim) * pac
+        dim = input_dim * pac
         self.pac = pac
         self.pacdim = dim
         seq = []
@@ -55,16 +113,6 @@ class Discriminator(Module):
 
         seq += [Linear(dim, 1)]
         self.seq = Sequential(*seq)
-        gcn_node_embedding_size = 1
-        self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size, cached=True)
-        self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
-        self.timestamp_layer = Linear(1, 1)
-        self.with_gcn = with_gcn
-        if self.with_gcn:
-            self.graph_dim = n_nodes * gcn_node_embedding_size
-        else:
-            self.graph_dim = graph_dim
-        self.gcn_metadata_embedding = Linear(self.graph_dim + 32, noise_embedding_dim)
 
     def calc_gradient_penalty(self, real_data, fake_data, device='cpu', pac=10, lambda_=10):
         """Compute the gradient penalty."""
@@ -113,26 +161,15 @@ class Residual(Module):
 class Generator(Module):
     """Generator for the CTGAN."""
 
-    def __init__(self, table_embedding_dim, generator_dim, data_dim, n_nodes, metadata_dim,
-                 graph_dim: int, with_gcn: bool, noise_embedding_dim=128):
+    def __init__(self, embedding_dim, generator_dim, data_dim):
         super(Generator, self).__init__()
-        dim = table_embedding_dim + noise_embedding_dim
+        dim = embedding_dim
         seq = []
         for item in list(generator_dim):
             seq += [Residual(dim, item)]
             dim += item
         seq.append(Linear(dim, data_dim))
         self.seq = Sequential(*seq)
-        gcn_node_embedding_size = 1
-        self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size, cached=True)
-        self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
-        self.timestamp_layer = Linear(1, 1)
-        self.with_gcn = with_gcn
-        if self.with_gcn:
-            self.graph_dim = n_nodes * gcn_node_embedding_size
-        else:
-            self.graph_dim = graph_dim
-        self.gcn_metadata_embedding = Linear(self.graph_dim + 32, noise_embedding_dim)
 
     def forward(self, input_):
         """Apply the Generator to the `input_`."""
@@ -233,13 +270,11 @@ class CTGAN(BaseSynthesizer):
 
         self._transformer = None
         self._data_sampler = None
+        self._noise = None
         self._generator = None
         self._discriminator = None
         self.optimizerG = None
         self.optimizerD = None
-        self.graph_data: Optional[torch.Tensor] = None
-        self.chain_data: Optional[torch.Tensor] = None
-        self.metadata: Optional[torch.Tensor] = None
 
     def get_device(self):
         return self._device
@@ -382,48 +417,47 @@ class CTGAN(BaseSynthesizer):
             train_data,
             self._transformer.output_info_list,
             self._log_frequency)
-        self.graph_data = torch.Tensor(graph_data.values).to(self._device)
-        self.chain_data = torch.Tensor(chain_data.values).to(self._device)
-        self.metadata = metadata
         self.metadata_dim = metadata.shape[1] if metadata is not None else 0
 
         data_dim = self._transformer.output_dimensions
 
-        self._generator = Generator(
-            self._embedding_dim,
-            self._generator_dim,
-            data_dim,
+        self._noise = Noise(
             n_nodes=self.n_nodes,
             metadata_dim=self.metadata_dim,
             graph_dim=graph_data.max() + 1,
             with_gcn=self.with_gcn,
+            device=self._device,
+            graph_index_to_edges=self.graph_index_to_edges,
+            graph_data=torch.Tensor(graph_data.values).to(self._device),
+            chain_data=torch.Tensor(chain_data.values).to(self._device),
+            metadata=metadata
+        ).to(self._device)
+
+        self._generator = Generator(
+            self._embedding_dim + self._noise.get_dim(),
+            self._generator_dim,
+            data_dim
         ).to(self._device)
         # wandb.watch(self._generator)
 
         self._discriminator = Discriminator(
-            data_dim,
+            data_dim + self._noise.get_dim(),
             self._discriminator_dim,
-            n_nodes=self.n_nodes,
-            metadata_dim=self.metadata_dim,
-            graph_dim=graph_data.max() + 1,
-            pac=self.pac,
-            with_gcn=self.with_gcn,
+            pac=self.pac
         ).to(self._device)
         # wandb.watch(self._discriminator)
         self._fit_for(train_data, epochs)
 
     def _fit_for(self, train_data, epochs):
-        if not self.optimizerG:
-            self.optimizerG = optim.Adam(
-                self._generator.parameters(), lr=self._generator_lr, betas=(0.5, 0.9),
-                weight_decay=self._generator_decay
-            )
+        self.optimizerG = self.optimizerG or optim.Adam(
+            self._generator.parameters(), lr=self._generator_lr, betas=(0.5, 0.9),
+            weight_decay=self._generator_decay
+        )
 
-        if not self.optimizerD:
-            self.optimizerD = optim.Adam(
-                self._discriminator.parameters(), lr=self._discriminator_lr,
-                betas=(0.5, 0.9), weight_decay=self._discriminator_decay
-            )
+        self.optimizerD = self.optimizerD or optim.Adam(
+            self._discriminator.parameters(), lr=self._discriminator_lr,
+            betas=(0.5, 0.9), weight_decay=self._discriminator_decay
+        )
 
         mean = torch.zeros(self._batch_size, self._embedding_dim, device=self._device)
         std = mean + 1
@@ -438,10 +472,9 @@ class CTGAN(BaseSynthesizer):
 
                     condvec = self._data_sampler.sample_condvec(self._batch_size)
                     if condvec is None:
-                        c1, m1, col, opt = None, None, None, None
+                        c1, m1, col, opt, c2 = None, None, None, None, None
                         idx = self._data_sampler.sample_data(self._batch_size, col, opt)
                         real = self._data_sampler._data[idx]
-                        chain, metadata, graph = None, None, None
                     else:
                         c1, m1, col, opt = condvec
                         c1 = torch.from_numpy(c1).to(self._device)
@@ -449,40 +482,22 @@ class CTGAN(BaseSynthesizer):
 
                         perm = np.arange(self._batch_size)
                         np.random.shuffle(perm)
-                        idx = self._data_sampler.sample_data(self._batch_size, col[perm],
-                                                             opt[perm])
+                        idx = self._data_sampler.sample_data(
+                            self._batch_size, col[perm], opt[perm])
                         real = self._data_sampler._data[idx]
-                        chain = self.chain_data[idx]
-                        metadata = None if self.metadata is None else self.metadata[idx]
-                        graph = None if self.graph_data is None else self.graph_data[idx]
 
-                        ones = torch.ones((self.n_nodes, 1)).to(self._device)
-                        graph = [Graph(graph_index.item(), ones,
-                                       self.graph_index_to_edges[graph_index.item()])
-                                 for graph_index in graph]
-
+                        c1 = self._noise.generate_noise_from_indexes(idx)
                         c2 = c1[perm]
-
-                    # TODO: Do we want to use the same layers for generator and discriminator?
-                    noise = generate_noise(
-                        batched_graphs=graph, batched_chain=chain,
-                        batched_metadata=metadata, gcn=self._generator.gcn,
-                        metadata_layer=self._generator.metadata_layer,
-                        timestamp_layer=self._generator.timestamp_layer,
-                        gcn_metadata_embedding=self._generator.gcn_metadata_embedding,
-                        with_gcn=self.with_gcn,
-                        graph_dim=self._generator.graph_dim
-                    )
-                    fakez = torch.cat([fakez, noise], dim=1)
+                        fakez = torch.cat([fakez, c1], dim=1)
 
                     fake = self._generator(fakez)
                     fakeact = self._apply_activate(fake)
 
                     real = torch.from_numpy(real.astype('float32')).to(self._device)
 
-                    if noise is not None:
-                        fake_cat = torch.cat([fakeact, noise], dim=1)
-                        real_cat = torch.cat([real, noise], dim=1)
+                    if c1 is not None:
+                        fake_cat = torch.cat([fakeact, c1], dim=1)
+                        real_cat = torch.cat([real, c2], dim=1)
                     else:
                         real_cat = real
                         fake_cat = fakeact
@@ -504,7 +519,6 @@ class CTGAN(BaseSynthesizer):
 
                 if condvec is None:
                     c1, m1, col, opt = None, None, None, None
-                    chain, metadata, graph = None, None, None
                 else:
                     c1, m1, col, opt = condvec
                     c1 = torch.from_numpy(c1).to(self._device)
@@ -514,31 +528,15 @@ class CTGAN(BaseSynthesizer):
                     np.random.shuffle(perm)
                     idx = self._data_sampler.sample_data(self._batch_size, col[perm],
                                                          opt[perm])
-                    chain = self.chain_data[idx]
-                    metadata = None if self.metadata is None else self.metadata[idx]
-                    graph = None if self.graph_data is None else self.graph_data[idx]
-                    ones = torch.ones((self.n_nodes, 1)).to(self._device)
-                    graph = [Graph(graph_index.item(), ones,
-                                   self.graph_index_to_edges[graph_index.item()])
-                             for graph_index in graph]
 
-                # TODO: Do we want to use the same layers for generator and discriminator?
-                noise = generate_noise(
-                    batched_graphs=graph, batched_chain=chain,
-                    batched_metadata=metadata, gcn=self._discriminator.gcn,
-                    metadata_layer=self._discriminator.metadata_layer,
-                    timestamp_layer=self._discriminator.timestamp_layer,
-                    gcn_metadata_embedding=self._discriminator.gcn_metadata_embedding,
-                    with_gcn=self.with_gcn,
-                    graph_dim=self._discriminator.graph_dim
-                )
-                fakez = torch.cat([fakez, noise], dim=1)
+                    c1 = self._noise.generate_noise_from_indexes(idx)
+                    fakez = torch.cat([fakez, c1], dim=1)
 
                 fake = self._generator(fakez)
                 fakeact = self._apply_activate(fake)
 
-                if noise is not None:
-                    y_fake = self._discriminator(torch.cat([fakeact, noise], dim=1))
+                if c1 is not None:
+                    y_fake = self._discriminator(torch.cat([fakeact, c1], dim=1))
                 else:
                     y_fake = self._discriminator(fakeact)
 
@@ -570,7 +568,7 @@ class CTGAN(BaseSynthesizer):
         self._fit_for(train_data, epochs)
 
     @random_state
-    def sample(self, n, graph_index, chain_index, metadata=None, should_pick_best=True):
+    def sample(self, n, graph_index, chain_index, metadata=None, should_pick_best=True) -> pd.DataFrame:
         """Sample data similar to the training data.
 
         Choosing a condition_column and condition_value will increase the probability of the
@@ -596,16 +594,10 @@ class CTGAN(BaseSynthesizer):
         fakeact = None
         for _ in range(10):
             fakez = torch.normal(mean=mean, std=std).to(self._device)
-            noise = generate_noise(
-                batched_graphs=graph, batched_chain=chain,
-                batched_metadata=metadata, gcn=self._generator.gcn,
-                metadata_layer=self._generator.metadata_layer,
-                timestamp_layer=self._generator.timestamp_layer,
-                gcn_metadata_embedding=self._generator.gcn_metadata_embedding,
-                with_gcn=self.with_gcn,
-                graph_dim=self._generator.graph_dim
+            c1 = self._noise.generate_noise_from_metadata(
+                batched_graphs=graph, batched_chain=chain, batched_metadata=metadata
             )
-            fakez = torch.cat([fakez, noise], dim=1)
+            fakez = torch.cat([fakez, c1], dim=1)
             fake = self._generator(fakez)
             fakeact = self._apply_activate(fake)
             if not should_pick_best:
@@ -618,7 +610,7 @@ class CTGAN(BaseSynthesizer):
             if len(filtered_normalized) > 0:
                 relevant_fakeact = torch.cat([
                     fakeact[relevant_indexes].repeat_interleave(self.pac, dim=0),
-                    noise[relevant_indexes].repeat_interleave(self.pac, dim=0)
+                    c1[relevant_indexes].repeat_interleave(self.pac, dim=0)
                 ], dim=1)
                 y_fake = self._discriminator(relevant_fakeact).detach().cpu().numpy()
                 best_idx = np.abs(y_fake).argmin()

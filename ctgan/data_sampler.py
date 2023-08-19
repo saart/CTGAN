@@ -1,5 +1,6 @@
 """DataSampler module."""
 from collections import Counter
+from typing import List
 
 import numpy as np
 
@@ -7,11 +8,8 @@ import numpy as np
 class DataSampler(object):
     """DataSampler samples the conditional vector and corresponding data for CTGAN."""
 
-    def __init__(self, data, output_info, log_frequency, graph_data, chain_data, metadata=None):
+    def __init__(self, data, output_info, log_frequency):
         self._data = data
-        self.graph_data = graph_data
-        self.chain_data = chain_data
-        self.metadata = metadata
 
         def is_discrete_column(column_info):
             return (len(column_info) == 1
@@ -131,7 +129,7 @@ class DataSampler(object):
 
         return cond
 
-    def sample_data(self, n, col, opt):
+    def sample_data(self, n, col, opt) -> List[int]:
         """Sample data from original training data satisfying the sampled conditional vector.
 
         Returns:
@@ -139,16 +137,14 @@ class DataSampler(object):
         """
         if col is None:
             idx = np.random.randint(len(self._data), size=n)
-            return self._data[idx]
+            return [idx]
 
         idx = []
 
         for (c, o), count in Counter(zip(col, opt)).items():
             idx.extend(np.random.choice(self._rid_by_cat_cols[c][o], count))
 
-        metadata = self.metadata[idx] if self.metadata is not None else None
-        chain_data = self.chain_data[idx] if self.chain_data is not None else None
-        return self._data[idx], self.graph_data[idx], chain_data, metadata
+        return idx
 
     def dim_cond_vec(self):
         """Return the total number of categories."""

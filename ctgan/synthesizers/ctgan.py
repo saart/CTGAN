@@ -1,7 +1,7 @@
 """CTGAN module."""
 
 import warnings
-from typing import NamedTuple, Union
+from typing import NamedTuple, Union, Optional
 import numpy as np
 import pandas as pd
 import torch
@@ -21,14 +21,15 @@ class Graph(NamedTuple):
     edge_index: torch.Tensor
 
 
-def generate_noise(batched_graphs, batched_chain, batched_metadata, gcn, metadata_layer, gcn_metadata_embedding, with_gcn, graph_dim):
+def generate_noise(batched_graphs, batched_chain, batched_metadata, gcn, metadata_layer,
+                   timestamp_layer, gcn_metadata_embedding, with_gcn, graph_dim):
     if with_gcn:
         unique_graphs = {graph.graph_index: graph for graph in batched_graphs}
         unique_gcn = {graph.graph_index: gcn(graph.x, graph.edge_index).flatten().unsqueeze(0) for graph in
                       unique_graphs.values()}
         graph_embedding = torch.concatenate([unique_gcn[graph.graph_index] for graph in batched_graphs])
     else:
-        graph_embedding = torch.zeros((len(batched_graphs), graph_dim))  # TODO: .to(device)
+        graph_embedding = torch.zeros((len(batched_graphs), graph_dim))
         for row_index, graph in enumerate(batched_graphs):
             graph_embedding[row_index][int(graph.graph_index)] = 1
 
@@ -36,6 +37,7 @@ def generate_noise(batched_graphs, batched_chain, batched_metadata, gcn, metadat
     all_metadata = torch.cat([batched_chain, batched_metadata], axis=1) if batched_metadata is not None else batched_chain
     embed_to_noise = torch.cat([graph_embedding, metadata_layer(all_metadata)], axis=1)
     return gcn_metadata_embedding(embed_to_noise)
+
 
 class Discriminator(Module):
     """Discriminator for the CTGAN."""
@@ -56,6 +58,7 @@ class Discriminator(Module):
         gcn_node_embedding_size = 1
         self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size, cached=True)
         self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
+        self.timestamp_layer = Linear(1, 1)
         self.with_gcn = with_gcn
         if self.with_gcn:
             self.graph_dim = n_nodes * gcn_node_embedding_size
@@ -63,7 +66,7 @@ class Discriminator(Module):
             self.graph_dim = graph_dim
         self.gcn_metadata_embedding = Linear(self.graph_dim + 32, noise_embedding_dim)
 
-    def calc_gradient_penalty(self, real_data, fake_data, graph, chain, metadata, device='cpu', pac=10, lambda_=10):
+    def calc_gradient_penalty(self, real_data, fake_data, device='cpu', pac=10, lambda_=10):
         """Compute the gradient penalty."""
         alpha = torch.rand(real_data.size(0) // pac, 1, 1, device=device)
         alpha = alpha.repeat(1, pac, real_data.size(1))
@@ -71,7 +74,7 @@ class Discriminator(Module):
 
         interpolates = alpha * real_data + ((1 - alpha) * fake_data)
 
-        disc_interpolates = self(interpolates, graph, chain, metadata)
+        disc_interpolates = self(interpolates)
 
         gradients = torch.autograd.grad(
             outputs=disc_interpolates, inputs=interpolates,
@@ -84,15 +87,8 @@ class Discriminator(Module):
 
         return gradient_penalty
 
-    def forward(self, input_, batched_graphs, batched_chain, batched_metadata=None):
+    def forward(self, input_):
         """Apply the Discriminator to the `input_`."""
-        noise = generate_noise(
-            batched_graphs=batched_graphs, batched_chain=batched_chain,
-            batched_metadata=batched_metadata, gcn=self.gcn, metadata_layer=self.metadata_layer,
-            gcn_metadata_embedding=self.gcn_metadata_embedding, with_gcn=self.with_gcn,
-            graph_dim=self.graph_dim
-        )
-        input_ = torch.cat([input_, noise], dim=1)
         assert input_.size()[0] % self.pac == 0
         return self.seq(input_.view(-1, self.pacdim))
 
@@ -117,7 +113,8 @@ class Residual(Module):
 class Generator(Module):
     """Generator for the CTGAN."""
 
-    def __init__(self, table_embedding_dim, generator_dim, data_dim, n_nodes, metadata_dim, graph_dim: int, with_gcn: bool, noise_embedding_dim=128):
+    def __init__(self, table_embedding_dim, generator_dim, data_dim, n_nodes, metadata_dim,
+                 graph_dim: int, with_gcn: bool, noise_embedding_dim=128):
         super(Generator, self).__init__()
         dim = table_embedding_dim + noise_embedding_dim
         seq = []
@@ -129,6 +126,7 @@ class Generator(Module):
         gcn_node_embedding_size = 1
         self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size, cached=True)
         self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
+        self.timestamp_layer = Linear(1, 1)
         self.with_gcn = with_gcn
         if self.with_gcn:
             self.graph_dim = n_nodes * gcn_node_embedding_size
@@ -136,15 +134,8 @@ class Generator(Module):
             self.graph_dim = graph_dim
         self.gcn_metadata_embedding = Linear(self.graph_dim + 32, noise_embedding_dim)
 
-    def forward(self, input_, batched_graphs, batched_chain, batched_metadata=None):
+    def forward(self, input_):
         """Apply the Generator to the `input_`."""
-        noise = generate_noise(
-            batched_graphs=batched_graphs, batched_chain=batched_chain,
-            batched_metadata=batched_metadata, gcn=self.gcn, metadata_layer=self.metadata_layer,
-            gcn_metadata_embedding=self.gcn_metadata_embedding, with_gcn=self.with_gcn,
-            graph_dim=self.graph_dim
-        )
-        input_ = torch.cat([input_, noise], dim=1)
         data = self.seq(input_)
         return data
 
@@ -229,23 +220,26 @@ class CTGAN(BaseSynthesizer):
         self.with_gcn = with_gcn
 
         if device:
-            self._device = device
+            pass
+        elif not cuda or not torch.cuda.is_available():
+            device = 'cpu'
+        elif isinstance(cuda, str):
+            device = cuda
         else:
-            if not cuda or not torch.cuda.is_available():
-                device = 'cpu'
-            elif isinstance(cuda, str):
-                device = cuda
-            else:
-                device = 'cuda'
+            device = 'cuda'
 
-            print(f"Using device: {device}")
-            self._device = torch.device(device)
+        self._device = torch.device(device)
         print(f"Use device: {self._device}")
 
         self._transformer = None
         self._data_sampler = None
         self._generator = None
         self._discriminator = None
+        self.optimizerG = None
+        self.optimizerD = None
+        self.graph_data: Optional[torch.Tensor] = None
+        self.chain_data: Optional[torch.Tensor] = None
+        self.metadata: Optional[torch.Tensor] = None
 
     def get_device(self):
         return self._device
@@ -349,7 +343,6 @@ class CTGAN(BaseSynthesizer):
         if invalid_columns:
             raise ValueError(f'Invalid columns found: {invalid_columns}')
 
-
     @random_state
     def fit(self, train_data, graph_data, chain_data, discrete_columns=(), metadata_discrete_columns=(), epochs=None, metadata=None):
         """Fit the CTGAN Synthesizer models to the training data.
@@ -376,6 +369,7 @@ class CTGAN(BaseSynthesizer):
 
         self._transformer = DataTransformer()
         self._transformer.fit(train_data, discrete_columns)
+
         train_data = self._transformer.transform(train_data)
 
         self._metadata_transformer = DataTransformer()
@@ -387,11 +381,10 @@ class CTGAN(BaseSynthesizer):
         self._data_sampler = DataSampler(
             train_data,
             self._transformer.output_info_list,
-            self._log_frequency,
-            graph_data=torch.Tensor(graph_data.values).to(self._device),
-            chain_data=torch.Tensor(chain_data.values).to(self._device),
-            metadata=metadata
-        )
+            self._log_frequency)
+        self.graph_data = torch.Tensor(graph_data.values).to(self._device)
+        self.chain_data = torch.Tensor(chain_data.values).to(self._device)
+        self.metadata = metadata
         self.metadata_dim = metadata.shape[1] if metadata is not None else 0
 
         data_dim = self._transformer.output_dimensions
@@ -419,63 +412,18 @@ class CTGAN(BaseSynthesizer):
         # wandb.watch(self._discriminator)
         self._fit_for(train_data, epochs)
 
-    def gen_generator_rand_data(self, mean, std):
-        fakez = torch.normal(mean=mean, std=std)
-
-        condvec = self._data_sampler.sample_condvec(self._batch_size)
-        if condvec is None:
-            c1, m1, col, opt = None, None, None, None
-            real = self._data_sampler.sample_data(self._batch_size, col, opt)
-            chain, metadata, graph = None, None, None
-        else:
-            c1, m1, col, opt = condvec
-            c1 = torch.from_numpy(c1).to(self._device)
-            m1 = torch.from_numpy(m1).to(self._device)
-
-            perm = np.arange(self._batch_size)
-            np.random.shuffle(perm)
-            real, graph, chain, metadata = self._data_sampler.sample_data(
-                self._batch_size, col[perm], opt[perm])
-            ones = torch.ones((self.n_nodes, 1)).to(self._device)
-            graph = [Graph(graph_index.item(), ones, self.graph_index_to_edges[graph_index.item()])
-                     for graph_index in graph]
-
-            c2 = c1[perm]
-
-        return fakez, condvec, real, graph, chain, metadata
-
-    def get_discriminator_rand_data(self, mean, std):
-        fakez = torch.normal(mean=mean, std=std)
-
-        condvec = self._data_sampler.sample_condvec(self._batch_size)
-        if condvec is None:
-            c1, m1, col, opt = None, None, None, None
-            real = self._data_sampler.sample_data(self._batch_size, col, opt)
-            chain, metadata, graph = None, None, None
-        else:
-            c1, m1, col, opt = condvec
-            c1 = torch.from_numpy(c1).to(self._device)
-            m1 = torch.from_numpy(m1).to(self._device)
-
-            perm = np.arange(self._batch_size)
-            np.random.shuffle(perm)
-            real, graph, chain, metadata = self._data_sampler.sample_data(
-                self._batch_size, col[perm], opt[perm])
-            ones = torch.ones((self.n_nodes, 1)).to(self._device)
-            graph = [Graph(graph_index.item(), ones, self.graph_index_to_edges[graph_index.item()])
-                     for graph_index in graph]
-        return fakez, condvec, real, graph, chain, metadata, c1, m1
-
     def _fit_for(self, train_data, epochs):
-        optimizerG = optim.Adam(
-            self._generator.parameters(), lr=self._generator_lr, betas=(0.5, 0.9),
-            weight_decay=self._generator_decay
-        )
+        if not self.optimizerG:
+            self.optimizerG = optim.Adam(
+                self._generator.parameters(), lr=self._generator_lr, betas=(0.5, 0.9),
+                weight_decay=self._generator_decay
+            )
 
-        optimizerD = optim.Adam(
-            self._discriminator.parameters(), lr=self._discriminator_lr,
-            betas=(0.5, 0.9), weight_decay=self._discriminator_decay
-        )
+        if not self.optimizerD:
+            self.optimizerD = optim.Adam(
+                self._discriminator.parameters(), lr=self._discriminator_lr,
+                betas=(0.5, 0.9), weight_decay=self._discriminator_decay
+            )
 
         mean = torch.zeros(self._batch_size, self._embedding_dim, device=self._device)
         std = mean + 1
@@ -486,31 +434,113 @@ class CTGAN(BaseSynthesizer):
             for id_ in range(steps_per_epoch):
 
                 for n in range(self._discriminator_steps):
-                    fakez, condvec, real, graph, chain, metadata = self.gen_generator_rand_data(mean, std)
+                    fakez = torch.normal(mean=mean, std=std)
 
-                    fake = self._generator(fakez, graph, chain, metadata)
+                    condvec = self._data_sampler.sample_condvec(self._batch_size)
+                    if condvec is None:
+                        c1, m1, col, opt = None, None, None, None
+                        idx = self._data_sampler.sample_data(self._batch_size, col, opt)
+                        real = self._data_sampler._data[idx]
+                        chain, metadata, graph = None, None, None
+                    else:
+                        c1, m1, col, opt = condvec
+                        c1 = torch.from_numpy(c1).to(self._device)
+                        m1 = torch.from_numpy(m1).to(self._device)
+
+                        perm = np.arange(self._batch_size)
+                        np.random.shuffle(perm)
+                        idx = self._data_sampler.sample_data(self._batch_size, col[perm],
+                                                             opt[perm])
+                        real = self._data_sampler._data[idx]
+                        chain = self.chain_data[idx]
+                        metadata = None if self.metadata is None else self.metadata[idx]
+                        graph = None if self.graph_data is None else self.graph_data[idx]
+
+                        ones = torch.ones((self.n_nodes, 1)).to(self._device)
+                        graph = [Graph(graph_index.item(), ones,
+                                       self.graph_index_to_edges[graph_index.item()])
+                                 for graph_index in graph]
+
+                        c2 = c1[perm]
+
+                    # TODO: Do we want to use the same layers for generator and discriminator?
+                    noise = generate_noise(
+                        batched_graphs=graph, batched_chain=chain,
+                        batched_metadata=metadata, gcn=self._generator.gcn,
+                        metadata_layer=self._generator.metadata_layer,
+                        timestamp_layer=self._generator.timestamp_layer,
+                        gcn_metadata_embedding=self._generator.gcn_metadata_embedding,
+                        with_gcn=self.with_gcn,
+                        graph_dim=self._generator.graph_dim
+                    )
+                    fakez = torch.cat([fakez, noise], dim=1)
+
+                    fake = self._generator(fakez)
                     fakeact = self._apply_activate(fake)
 
                     real = torch.from_numpy(real.astype('float32')).to(self._device)
 
-                    y_fake = self._discriminator(fakeact, graph, chain, metadata)
-                    y_real = self._discriminator(real, graph, chain, metadata)
+                    if noise is not None:
+                        fake_cat = torch.cat([fakeact, noise], dim=1)
+                        real_cat = torch.cat([real, noise], dim=1)
+                    else:
+                        real_cat = real
+                        fake_cat = fakeact
+
+                    y_fake = self._discriminator(fake_cat)
+                    y_real = self._discriminator(real_cat)
 
                     pen = self._discriminator.calc_gradient_penalty(
-                        real, fakeact, graph, chain, metadata, self._device, self.pac)
+                        real_cat, fake_cat, self._device, self.pac)
                     loss_d = -(torch.mean(y_real) - torch.mean(y_fake))
 
-                    optimizerD.zero_grad(set_to_none=False)
+                    self.optimizerD.zero_grad(set_to_none=False)
                     pen.backward(retain_graph=True)
                     loss_d.backward()
-                    optimizerD.step()
+                    self.optimizerD.step()
 
-                fakez, condvec, real, graph, chain, metadata, c1, m1 = self.get_discriminator_rand_data(mean, std)
+                fakez = torch.normal(mean=mean, std=std)
+                condvec = self._data_sampler.sample_condvec(self._batch_size)
 
-                fake = self._generator(fakez, graph, chain, metadata)
+                if condvec is None:
+                    c1, m1, col, opt = None, None, None, None
+                    chain, metadata, graph = None, None, None
+                else:
+                    c1, m1, col, opt = condvec
+                    c1 = torch.from_numpy(c1).to(self._device)
+                    m1 = torch.from_numpy(m1).to(self._device)
+
+                    perm = np.arange(self._batch_size)
+                    np.random.shuffle(perm)
+                    idx = self._data_sampler.sample_data(self._batch_size, col[perm],
+                                                         opt[perm])
+                    chain = self.chain_data[idx]
+                    metadata = None if self.metadata is None else self.metadata[idx]
+                    graph = None if self.graph_data is None else self.graph_data[idx]
+                    ones = torch.ones((self.n_nodes, 1)).to(self._device)
+                    graph = [Graph(graph_index.item(), ones,
+                                   self.graph_index_to_edges[graph_index.item()])
+                             for graph_index in graph]
+
+                # TODO: Do we want to use the same layers for generator and discriminator?
+                noise = generate_noise(
+                    batched_graphs=graph, batched_chain=chain,
+                    batched_metadata=metadata, gcn=self._discriminator.gcn,
+                    metadata_layer=self._discriminator.metadata_layer,
+                    timestamp_layer=self._discriminator.timestamp_layer,
+                    gcn_metadata_embedding=self._discriminator.gcn_metadata_embedding,
+                    with_gcn=self.with_gcn,
+                    graph_dim=self._discriminator.graph_dim
+                )
+                fakez = torch.cat([fakez, noise], dim=1)
+
+                fake = self._generator(fakez)
                 fakeact = self._apply_activate(fake)
 
-                y_fake = self._discriminator(fakeact, graph, chain, metadata)
+                if noise is not None:
+                    y_fake = self._discriminator(torch.cat([fakeact, noise], dim=1))
+                else:
+                    y_fake = self._discriminator(fakeact)
 
                 if condvec is None:
                     cross_entropy = 0
@@ -519,9 +549,9 @@ class CTGAN(BaseSynthesizer):
 
                 loss_g = -torch.mean(y_fake) + cross_entropy
 
-                optimizerG.zero_grad(set_to_none=False)
+                self.optimizerG.zero_grad(set_to_none=False)
                 loss_g.backward()
-                optimizerG.step()
+                self.optimizerG.step()
 
             if self._verbose:
                 print(f'Epoch {i+1}, Loss G: {loss_g.detach().cpu(): .4f},'  # noqa: T001
@@ -530,6 +560,14 @@ class CTGAN(BaseSynthesizer):
 
             if self.functional_loss_freq and self.functional_loss and (i+1) % self.functional_loss_freq == 0:
                 self.functional_loss(i)
+
+    def continue_fit(self, train_data, epochs=None):
+        self._data_sampler = DataSampler(
+            train_data,
+            self._transformer.output_info_list,
+            self._log_frequency,
+        )
+        self._fit_for(train_data, epochs)
 
     @random_state
     def sample(self, n, graph_index, chain_index, metadata=None, should_pick_best=True):
@@ -555,23 +593,34 @@ class CTGAN(BaseSynthesizer):
 
         mean = torch.zeros(n, self._embedding_dim)
         std = mean + 1
+        fakeact = None
         for _ in range(10):
             fakez = torch.normal(mean=mean, std=std).to(self._device)
-            fake = self._generator(fakez, graph, chain, metadata)
+            noise = generate_noise(
+                batched_graphs=graph, batched_chain=chain,
+                batched_metadata=metadata, gcn=self._generator.gcn,
+                metadata_layer=self._generator.metadata_layer,
+                timestamp_layer=self._generator.timestamp_layer,
+                gcn_metadata_embedding=self._generator.gcn_metadata_embedding,
+                with_gcn=self.with_gcn,
+                graph_dim=self._generator.graph_dim
+            )
+            fakez = torch.cat([fakez, noise], dim=1)
+            fake = self._generator(fakez)
             fakeact = self._apply_activate(fake)
             if not should_pick_best:
                 break
-            normalized = self._transformer.inverse_transform(fakeact.detach().cpu().numpy(), columns={"graph", "chain"})
-            relevant_indexes = (normalized["graph"] == graph_index)
+            normalized: pd.DataFrame = self._transformer.inverse_transform(fakeact.detach().cpu().numpy(), columns={"graph", "chain"})
+            relevant_indexes: pd.Series = normalized["graph"].eq(graph_index)
             if chain_index is not None:
                 relevant_indexes &= (normalized["chain"] == chain_index)
             filtered_normalized = normalized[relevant_indexes]
             if len(filtered_normalized) > 0:
-                relevant_metadata = metadata[relevant_indexes].repeat_interleave(self.pac, dim=0) if metadata is not None else None
-                relevant_graphs = [g for should, g in zip(relevant_indexes, graph) for i in range(self.pac) if should]
-                relevant_fakeact = fakeact[relevant_indexes].repeat_interleave(self.pac, dim=0)
-                relevant_chain = chain[relevant_indexes].repeat_interleave(self.pac, dim=0)
-                y_fake = self._discriminator(relevant_fakeact, relevant_graphs, relevant_chain, relevant_metadata).detach().cpu().numpy()
+                relevant_fakeact = torch.cat([
+                    fakeact[relevant_indexes].repeat_interleave(self.pac, dim=0),
+                    noise[relevant_indexes].repeat_interleave(self.pac, dim=0)
+                ], dim=1)
+                y_fake = self._discriminator(relevant_fakeact).detach().cpu().numpy()
                 best_idx = np.abs(y_fake).argmin()
                 fakeact = relevant_fakeact[best_idx:best_idx+1]
                 break

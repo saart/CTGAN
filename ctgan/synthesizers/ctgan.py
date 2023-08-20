@@ -8,7 +8,6 @@ import torch
 from torch import optim
 from torch.nn import BatchNorm1d, Dropout, LeakyReLU, Linear, Module, ReLU, Sequential, functional
 import torch_geometric
-# import wandb
 
 from ctgan.data_sampler import DataSampler
 from ctgan.data_transformer import DataTransformer
@@ -26,7 +25,8 @@ class Noise(Module):
         self, metadata_dim, with_gcn, n_nodes, graph_dim, device, graph_index_to_edges,
         graph_data: Optional[torch.Tensor] = None,
         chain_data: Optional[torch.Tensor] = None,
-        metadata: Optional[torch.Tensor] = None,
+        trigger_data: Optional[torch.Tensor] = None,
+        tx_start_time: torch.Tensor = None,
         noise_embedding_dim=128
     ):
         super().__init__()
@@ -41,17 +41,27 @@ class Noise(Module):
             self.graph_dim = n_nodes * gcn_node_embedding_size
         else:
             self.graph_dim = graph_dim
+        self.use_tx_time = tx_start_time is not None
+        self.use_metadata = trigger_data is not None
 
         # Layers
         self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size, cached=True)
-        self.metadata_layer = Sequential(Linear(1 + metadata_dim, 32), torch.nn.ReLU())
-        self.timestamp_layer = Linear(1, 1)
-        self.gcn_metadata_embedding = Linear(self.graph_dim + 32, noise_embedding_dim)
+        self.triggering_layer = Sequential(Linear(metadata_dim, 32), torch.nn.ReLU())
+        self.noise_embedding = Linear(
+            (
+                self.graph_dim
+                + 1  # chain
+                + (32 if self.use_metadata else 0)
+                + (1 if self.use_tx_time else 0)
+            ),
+            noise_embedding_dim
+        )
 
         # Data
         self.graph_data = graph_data
         self.chain_data = chain_data
-        self.metadata = metadata
+        self.trigger_data = trigger_data
+        self.tx_start_time = tx_start_time
 
     def get_dim(self) -> int:
         return self.noise_embedding_dim
@@ -63,8 +73,9 @@ class Noise(Module):
 
     def generate_noise_from_indexes(self, idx: List[int]):
         chain = self.chain_data[idx]
-        metadata = None if self.metadata is None else self.metadata[idx]
+        trigger_data = None if self.trigger_data is None else self.trigger_data[idx]
         graph = None if self.graph_data is None else self.graph_data[idx]
+        tx_start_time = self.tx_start_time[idx] if self.use_tx_time else None
 
         ones = torch.ones((self.n_nodes, 1)).to(self.device)
         graph = [Graph(graph_index.item(), ones, self.graph_index_to_edges[graph_index.item()])
@@ -72,35 +83,30 @@ class Noise(Module):
 
         # TODO: Do we want to use the same layers for generator and discriminator?
         return self.generate_noise_from_metadata(
-            batched_graphs=graph, batched_chain=chain, batched_metadata=metadata
+            batched_graphs=graph, batched_chain=chain, trigger_data=trigger_data,
+            tx_start_time=tx_start_time
         )
 
-    def generate_noise_from_metadata(self, batched_metadata, batched_chain, batched_graphs):
-        return self.generate_noise(
-            batched_graphs=batched_graphs, batched_chain=batched_chain,
-            batched_metadata=batched_metadata, gcn=self.gcn,
-            metadata_layer=self.metadata_layer, timestamp_layer=self.timestamp_layer,
-            gcn_metadata_embedding=self.gcn_metadata_embedding, with_gcn=self.with_gcn,
-            graph_dim=self.graph_dim
-        )
-
-    @staticmethod
-    def generate_noise(batched_graphs, batched_chain, batched_metadata, gcn, metadata_layer,
-                       timestamp_layer, gcn_metadata_embedding, with_gcn, graph_dim):
-        if with_gcn:
+    def generate_noise_from_metadata(
+        self, trigger_data, batched_chain, batched_graphs, tx_start_time
+    ):
+        if self.with_gcn:
             unique_graphs = {graph.graph_index: graph for graph in batched_graphs}
-            unique_gcn = {graph.graph_index: gcn(graph.x, graph.edge_index).flatten().unsqueeze(0) for graph in
+            unique_gcn = {graph.graph_index: self.gcn(graph.x, graph.edge_index).flatten().unsqueeze(0) for graph in
                           unique_graphs.values()}
             graph_embedding = torch.concatenate([unique_gcn[graph.graph_index] for graph in batched_graphs])
         else:
-            graph_embedding = torch.zeros((len(batched_graphs), graph_dim))
+            graph_embedding = torch.zeros((len(batched_graphs), self.graph_dim))
             for row_index, graph in enumerate(batched_graphs):
                 graph_embedding[row_index][int(graph.graph_index)] = 1
 
-        batched_chain = batched_chain.unsqueeze(1)
-        all_metadata = torch.cat([batched_chain, batched_metadata], dim=1) if batched_metadata is not None else batched_chain
-        embed_to_noise = torch.cat([graph_embedding, metadata_layer(all_metadata)], dim=1)
-        return gcn_metadata_embedding(embed_to_noise)
+        embed_to_noise = torch.cat(
+            [graph_embedding, batched_chain.unsqueeze(1)]
+            + ([self.triggering_layer(trigger_data)] if self.use_metadata else [])
+            + ([tx_start_time.unsqueeze(1)] if self.use_tx_time else []),
+            dim=1
+        )
+        return self.noise_embedding(embed_to_noise)
 
 
 class Discriminator(Module):
@@ -277,9 +283,6 @@ class CTGAN(BaseSynthesizer):
         self._data_sampler = None
         self._noise = None
         self._generator = None
-        self._discriminator = None
-        self.optimizerG = None
-        self.optimizerD = None
 
     def get_device(self):
         return self._device
@@ -384,7 +387,7 @@ class CTGAN(BaseSynthesizer):
             raise ValueError(f'Invalid columns found: {invalid_columns}')
 
     @random_state
-    def fit(self, train_data, graph_data, chain_data, discrete_columns=(), metadata_discrete_columns=(), epochs=None, metadata=None):
+    def fit(self, train_data, graph_data, chain_data, tx_start_time=None, discrete_columns=(), metadata_discrete_columns=(), epochs=None, metadata=None):
         """Fit the CTGAN Synthesizer models to the training data.
 
         Args:
@@ -435,7 +438,8 @@ class CTGAN(BaseSynthesizer):
             graph_index_to_edges=self.graph_index_to_edges,
             graph_data=torch.Tensor(graph_data.values).to(self._device),
             chain_data=torch.Tensor(chain_data.values).to(self._device),
-            metadata=metadata
+            trigger_data=metadata,
+            tx_start_time=torch.Tensor(tx_start_time.values).to(self._device) if tx_start_time is not None else None,
         ).to(self._device)
 
         self._generator = Generator(
@@ -443,27 +447,26 @@ class CTGAN(BaseSynthesizer):
             self._generator_dim,
             data_dim
         ).to(self._device)
-        # wandb.watch(self._generator)
 
-        self._discriminator = Discriminator(
+        discriminator = Discriminator(
             data_dim + self._noise.get_dim(),
             self._discriminator_dim,
             pac=self.pac
         ).to(self._device)
-        # wandb.watch(self._discriminator)
-        self._fit_for(train_data, epochs)
 
-    def _fit_for(self, train_data, epochs):
-        self.optimizerG = self.optimizerG or optim.Adam(
+        optimizerG = optim.Adam(
             self._generator.parameters(), lr=self._generator_lr, betas=(0.5, 0.9),
             weight_decay=self._generator_decay
         )
 
-        self.optimizerD = self.optimizerD or optim.Adam(
-            self._discriminator.parameters(), lr=self._discriminator_lr,
+        optimizerD = optim.Adam(
+            discriminator.parameters(), lr=self._discriminator_lr,
             betas=(0.5, 0.9), weight_decay=self._discriminator_decay
         )
+        self._fit_for(train_data, epochs, discriminator, optimizerG, optimizerD)
+        return discriminator, optimizerG, optimizerD
 
+    def _fit_for(self, train_data, epochs, discriminator, optimizerG, optimizerD):
         mean = torch.zeros(self._batch_size, self._embedding_dim, device=self._device)
         std = mean + 1
 
@@ -507,17 +510,17 @@ class CTGAN(BaseSynthesizer):
                         real_cat = real
                         fake_cat = fakeact
 
-                    y_fake = self._discriminator(fake_cat)
-                    y_real = self._discriminator(real_cat)
+                    y_fake = discriminator(fake_cat)
+                    y_real = discriminator(real_cat)
 
-                    pen = self._discriminator.calc_gradient_penalty(
+                    pen = discriminator.calc_gradient_penalty(
                         real_cat, fake_cat, self._device, self.pac)
                     loss_d = -(torch.mean(y_real) - torch.mean(y_fake))
 
-                    self.optimizerD.zero_grad(set_to_none=False)
+                    optimizerD.zero_grad(set_to_none=False)
                     pen.backward(retain_graph=True)
                     loss_d.backward()
-                    self.optimizerD.step()
+                    optimizerD.step()
 
                 fakez = torch.normal(mean=mean, std=std)
                 condvec = self._data_sampler.sample_condvec(self._batch_size)
@@ -541,9 +544,9 @@ class CTGAN(BaseSynthesizer):
                 fakeact = self._apply_activate(fake)
 
                 if c1 is not None:
-                    y_fake = self._discriminator(torch.cat([fakeact, c1], dim=1))
+                    y_fake = discriminator(torch.cat([fakeact, c1], dim=1))
                 else:
-                    y_fake = self._discriminator(fakeact)
+                    y_fake = discriminator(fakeact)
 
                 if condvec is None:
                     cross_entropy = 0
@@ -552,9 +555,9 @@ class CTGAN(BaseSynthesizer):
 
                 loss_g = -torch.mean(y_fake) + cross_entropy
 
-                self.optimizerG.zero_grad(set_to_none=False)
+                optimizerG.zero_grad(set_to_none=False)
                 loss_g.backward()
-                self.optimizerG.step()
+                optimizerG.step()
 
             if self._verbose:
                 print(f'Epoch {i+1}, Loss G: {loss_g.detach().cpu(): .4f},'  # noqa: T001
@@ -564,16 +567,16 @@ class CTGAN(BaseSynthesizer):
             if self.functional_loss_freq and self.functional_loss and (i+1) % self.functional_loss_freq == 0:
                 self.functional_loss(i)
 
-    def continue_fit(self, train_data, epochs=None):
+    def continue_fit(self, train_data, optimizerG, optimizerD, epochs=None):
         self._data_sampler = DataSampler(
             train_data,
             self._transformer.output_info_list,
             self._log_frequency,
         )
-        self._fit_for(train_data, epochs)
+        self._fit_for(train_data, epochs, optimizerG, optimizerD)
 
     @random_state
-    def sample(self, n, graph_index, chain_index, metadata=None, should_pick_best=True) -> pd.DataFrame:
+    def sample(self, n, graph_index, chain_index, metadata=None, tx_start_time=None) -> pd.DataFrame:
         """Sample data similar to the training data.
 
         Choosing a condition_column and condition_value will increase the probability of the
@@ -582,11 +585,12 @@ class CTGAN(BaseSynthesizer):
         Returns:
             numpy.ndarray or pandas.DataFrame
         """
-        n = n or self._batch_size
+        n = n or (self._batch_size - 1)
         edges = self.graph_index_to_edges[graph_index].to(self._device)
         ones = torch.ones((self.n_nodes, 1)).to(self._device)
         graph = [Graph(x=ones, edge_index=edges, graph_index=graph_index) for _ in range(n)]
         chain = torch.tensor([(chain_index or 0) for _ in range(n)]).type(torch.float32).to(self._device)
+        tx_start_time = torch.tensor([tx_start_time for _ in range(n)]).type(torch.float32).to(self._device) if tx_start_time is not None else None
         if metadata is not None:
             metadata = self._metadata_transformer.transform(metadata)
             metadata = metadata.repeat(len(graph), axis=0)
@@ -594,34 +598,34 @@ class CTGAN(BaseSynthesizer):
         else:
             assert self.metadata_dim == 0, "Most provide metadata in the metadata-based CTGAN"
 
-        mean = torch.zeros(n, self._embedding_dim)
-        std = mean + 1
-        fakeact = None
-        for _ in range(10):
+
+        steps = n // self._batch_size + 1
+        data = []
+        for i in range(steps):
+            mean = torch.zeros(self._batch_size, self._embedding_dim)
+            std = mean + 1
             fakez = torch.normal(mean=mean, std=std).to(self._device)
-            c1 = self._noise.generate_noise_from_metadata(
-                batched_graphs=graph, batched_chain=chain, batched_metadata=metadata
+
+            condvec = self._noise.generate_noise_from_metadata(
+                batched_graphs=graph, batched_chain=chain, trigger_data=metadata,
+                tx_start_time=tx_start_time
             )
-            fakez = torch.cat([fakez, c1], dim=1)
+
+            if condvec is None:
+                pass
+            else:
+                c1 = condvec
+                c1 = torch.from_numpy(c1).to(self._device)
+                fakez = torch.cat([fakez, c1], dim=1)
+
             fake = self._generator(fakez)
             fakeact = self._apply_activate(fake)
-            if not should_pick_best:
-                break
-            normalized: pd.DataFrame = self._transformer.inverse_transform(fakeact.detach().cpu().numpy(), columns={"graph", "chain"})
-            relevant_indexes: pd.Series = normalized["graph"].eq(graph_index)
-            if chain_index is not None:
-                relevant_indexes &= (normalized["chain"] == chain_index)
-            filtered_normalized = normalized[relevant_indexes]
-            if len(filtered_normalized) > 0:
-                relevant_fakeact = torch.cat([
-                    fakeact[relevant_indexes].repeat_interleave(self.pac, dim=0),
-                    c1[relevant_indexes].repeat_interleave(self.pac, dim=0)
-                ], dim=1)
-                y_fake = self._discriminator(relevant_fakeact).detach().cpu().numpy()
-                best_idx = np.abs(y_fake).argmin()
-                fakeact = relevant_fakeact[best_idx:best_idx+1]
-                break
-        return self._transformer.inverse_transform(fakeact.detach().cpu().numpy())
+            data.append(fakeact.detach().cpu().numpy())
+
+        data = np.concatenate(data, axis=0)
+        data = data[:n]
+
+        return self._transformer.inverse_transform(data)
 
     def set_device(self, device):
         """Set the `device` to be used ('GPU' or 'CPU)."""

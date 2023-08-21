@@ -45,8 +45,11 @@ class Noise(Module):
         self.use_metadata = trigger_data is not None
 
         # Layers
-        self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size, cached=True)
-        self.triggering_layer = Sequential(Linear(metadata_dim, 32), torch.nn.ReLU())
+        self.gcn = torch_geometric.nn.GCNConv(1, gcn_node_embedding_size)
+        if metadata_dim:
+            self.triggering_layer = Sequential(Linear(metadata_dim, 32), torch.nn.ReLU())
+        else:
+            self.triggering_layer = None
         self.noise_embedding = Linear(
             (
                 self.graph_dim
@@ -77,8 +80,7 @@ class Noise(Module):
         graph = None if self.graph_data is None else self.graph_data[idx]
         tx_start_time = self.tx_start_time[idx] if self.use_tx_time else None
 
-        ones = torch.ones((self.n_nodes, 1)).to(self.device)
-        graph = [Graph(graph_index.item(), ones, self.graph_index_to_edges[graph_index.item()])
+        graph = [Graph(graph_index.item(), torch.ones((self.n_nodes, 1)).to(self.device), self.graph_index_to_edges[graph_index.item()])
                  for graph_index in graph]
 
         # TODO: Do we want to use the same layers for generator and discriminator?
@@ -281,7 +283,7 @@ class CTGAN(BaseSynthesizer):
 
         self._transformer = None
         self._data_sampler = None
-        self._noise = None
+        self._noise: Optional[Noise] = None
         self._generator = None
 
     def get_device(self):
@@ -386,7 +388,7 @@ class CTGAN(BaseSynthesizer):
         if invalid_columns:
             raise ValueError(f'Invalid columns found: {invalid_columns}')
 
-    @random_state
+    # @random_state
     def fit(self, train_data, graph_data, chain_data, tx_start_time=None, discrete_columns=(), metadata_discrete_columns=(), epochs=None, metadata=None):
         """Fit the CTGAN Synthesizer models to the training data.
 
@@ -419,7 +421,6 @@ class CTGAN(BaseSynthesizer):
         if metadata is not None:
             self._metadata_transformer.fit(metadata, metadata_discrete_columns)
             metadata = self._metadata_transformer.transform(metadata)
-            metadata = torch.from_numpy(metadata).type(torch.float32).to(self._device)
 
         self._data_sampler = DataSampler(
             train_data,
@@ -438,7 +439,7 @@ class CTGAN(BaseSynthesizer):
             graph_index_to_edges=self.graph_index_to_edges,
             graph_data=torch.Tensor(graph_data.values).to(self._device),
             chain_data=torch.Tensor(chain_data.values).to(self._device),
-            trigger_data=metadata,
+            trigger_data=torch.from_numpy(metadata).type(torch.float32).to(self._device) if metadata is not None else None,
             tx_start_time=torch.Tensor(tx_start_time.values).to(self._device) if tx_start_time is not None else None,
         ).to(self._device)
 
@@ -464,7 +465,11 @@ class CTGAN(BaseSynthesizer):
             betas=(0.5, 0.9), weight_decay=self._discriminator_decay
         )
         self._fit_for(train_data, epochs, discriminator, optimizerG, optimizerD)
-        return discriminator, optimizerG, optimizerD
+        return {
+            "discriminator": discriminator,
+            "optimizerG": optimizerG,
+            "optimizerD": optimizerD,
+        }
 
     def _fit_for(self, train_data, epochs, discriminator, optimizerG, optimizerD):
         mean = torch.zeros(self._batch_size, self._embedding_dim, device=self._device)
@@ -567,16 +572,25 @@ class CTGAN(BaseSynthesizer):
             if self.functional_loss_freq and self.functional_loss and (i+1) % self.functional_loss_freq == 0:
                 self.functional_loss(i)
 
-    def continue_fit(self, train_data, optimizerG, optimizerD, epochs=None):
+    def continue_fit(self, train_data, graph_data, chain_data, tx_start_time, metadata, discriminator, optimizerG, optimizerD):
+        train_data = self._transformer.transform(train_data)
+        if metadata is not None:
+            metadata = self._metadata_transformer.transform(metadata)
+
+        self._noise.graph_data = torch.Tensor(graph_data.values).to(self._device)
+        self._noise.chain_data = torch.Tensor(chain_data.values).to(self._device)
+        self._noise.trigger_data = torch.from_numpy(metadata).type(torch.float32).to(self._device) if metadata is not None else None
+        self._noise.tx_start_time = torch.Tensor(tx_start_time.values).to(self._device) if tx_start_time is not None else None
+
         self._data_sampler = DataSampler(
             train_data,
             self._transformer.output_info_list,
             self._log_frequency,
         )
-        self._fit_for(train_data, epochs, optimizerG, optimizerD)
+        self._fit_for(train_data, self._epochs, discriminator, optimizerG, optimizerD)
 
-    @random_state
-    def sample(self, n, graph_index, chain_index, metadata=None, tx_start_time=None) -> pd.DataFrame:
+    # @random_state
+    def sample(self, n, graph_index, chain_index, metadata=None, tx_start_time=None, columns: Optional[List[str]] = None, normalize_trigger_data: bool = True) -> pd.DataFrame:
         """Sample data similar to the training data.
 
         Choosing a condition_column and condition_value will increase the probability of the
@@ -586,14 +600,16 @@ class CTGAN(BaseSynthesizer):
             numpy.ndarray or pandas.DataFrame
         """
         n = n or (self._batch_size - 1)
+        if n == 1:
+            raise ValueError('n must be greater than 1')
         edges = self.graph_index_to_edges[graph_index].to(self._device)
-        ones = torch.ones((self.n_nodes, 1)).to(self._device)
-        graph = [Graph(x=ones, edge_index=edges, graph_index=graph_index) for _ in range(n)]
+        graph = [Graph(x=torch.ones((self.n_nodes, 1)).to(self._device), edge_index=edges, graph_index=graph_index) for _ in range(n)]
         chain = torch.tensor([(chain_index or 0) for _ in range(n)]).type(torch.float32).to(self._device)
         tx_start_time = torch.tensor([tx_start_time for _ in range(n)]).type(torch.float32).to(self._device) if tx_start_time is not None else None
         if metadata is not None:
-            metadata = self._metadata_transformer.transform(metadata)
-            metadata = metadata.repeat(len(graph), axis=0)
+            if normalize_trigger_data:
+                metadata = self._metadata_transformer.transform(metadata)
+            metadata = metadata.repeat(n, axis=0)
             metadata = torch.from_numpy(metadata).type(torch.float32).to(self._device)
         else:
             assert self.metadata_dim == 0, "Most provide metadata in the metadata-based CTGAN"
@@ -617,14 +633,14 @@ class CTGAN(BaseSynthesizer):
                 c1 = condvec
                 fakez = torch.cat([fakez, c1], dim=1)
 
-            fake = self._generator(fakez)
-            fakeact = self._apply_activate(fake)
+            fake = self._generator(fakez).unique(dim=0)
+            fakeact = self._apply_activate(fake).unique(dim=0)
             data.append(fakeact.detach().cpu().numpy())
 
         data = np.concatenate(data, axis=0)
         data = data[:n]
 
-        return self._transformer.inverse_transform(data)
+        return self._transformer.inverse_transform(data, columns=columns)
 
     def set_device(self, device):
         """Set the `device` to be used ('GPU' or 'CPU)."""

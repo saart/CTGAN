@@ -90,7 +90,7 @@ class Noise(Module):
         )
 
     def generate_noise_from_metadata(
-        self, trigger_data, batched_chain, batched_graphs, tx_start_time
+        self, trigger_data, batched_chain, batched_graphs: List[Graph], tx_start_time: torch.Tensor
     ):
         if self.with_gcn:
             unique_graphs = {graph.graph_index: graph for graph in batched_graphs}
@@ -590,7 +590,30 @@ class CTGAN(BaseSynthesizer):
         self._fit_for(train_data, self._epochs, discriminator, optimizerG, optimizerD)
 
     # @random_state
-    def sample(self, n, graph_index, chain_index, metadata=None, tx_start_time=None, columns: Optional[List[str]] = None, normalize_trigger_data: bool = True) -> pd.DataFrame:
+    def sample_one(self, graph_index: int, chain_index: Optional[int],
+                   metadata: Optional[np.ndarray] = None,
+                   tx_start_time: Optional[int] = None,
+                   columns: Optional[List[str]] = None,
+                   normalize_trigger_data: bool = True) -> pd.DataFrame:
+        n = 2
+        if n == 1:
+            raise ValueError('n must be greater than 1')
+        graph_index_list = [graph_index for _ in range(n)]
+        chain_index_list = [chain_index or 0 for _ in range(n)]
+        tx_start_time_list = [tx_start_time for _ in range(n)] if tx_start_time is not None else None
+        if metadata is not None:
+            metadata = metadata.repeat(n, axis=0)
+        return self.sample(
+            graph_index_list=graph_index_list, chain_index_list=chain_index_list,
+            metadata_list=metadata, tx_start_time_list=tx_start_time_list, columns=columns,
+            normalize_trigger_data=normalize_trigger_data
+        )
+
+    def sample(self, graph_index_list: List[int], chain_index_list: List[int],
+               metadata_list: Optional[List[np.ndarray]] = None,
+               tx_start_time_list: Optional[List[int]] = None,
+               columns: Optional[List[str]] = None,
+               normalize_trigger_data: bool = True) -> pd.DataFrame:
         """Sample data similar to the training data.
 
         Choosing a condition_column and condition_value will increase the probability of the
@@ -599,32 +622,37 @@ class CTGAN(BaseSynthesizer):
         Returns:
             numpy.ndarray or pandas.DataFrame
         """
-        n = n or (self._batch_size - 1)
-        if n == 1:
-            raise ValueError('n must be greater than 1')
-        edges = self.graph_index_to_edges[graph_index].to(self._device)
-        graph = [Graph(x=torch.ones((self.n_nodes, 1)).to(self._device), edge_index=edges, graph_index=graph_index) for _ in range(n)]
-        chain = torch.tensor([(chain_index or 0) for _ in range(n)]).type(torch.float32).to(self._device)
-        tx_start_time = torch.tensor([tx_start_time for _ in range(n)]).type(torch.float32).to(self._device) if tx_start_time is not None else None
-        if metadata is not None:
+        n = len(graph_index_list)
+
+        graph = [Graph(
+            x=torch.ones((self.n_nodes, 1)).to(self._device),
+            edge_index=self.graph_index_to_edges[graph_index].to(self._device),
+            graph_index=graph_index
+        ) for graph_index in graph_index_list]
+
+        chain = torch.tensor(chain_index_list).type(torch.float32).to(self._device)
+        tx_start_time = torch.tensor(tx_start_time_list).type(torch.float32).to(self._device) if tx_start_time_list is not None else None
+        if metadata_list is not None:
             if normalize_trigger_data:
-                metadata = self._metadata_transformer.transform(metadata)
-            metadata = metadata.repeat(n, axis=0)
-            metadata = torch.from_numpy(metadata).type(torch.float32).to(self._device)
+                metadata_list = [self._metadata_transformer.transform(m) for m in metadata_list]
+            metadata = torch.from_numpy(metadata_list).type(torch.float32).to(self._device)
         else:
             assert self.metadata_dim == 0, "Most provide metadata in the metadata-based CTGAN"
+            metadata = None
 
-
-        steps = n // self._batch_size + 1
+        steps = (n-1) // self._batch_size + 1
         data = []
         for i in range(steps):
-            mean = torch.zeros(n, self._embedding_dim)
+            f, t = i * self._batch_size, min((i + 1) * self._batch_size, n)
+            mean = torch.zeros(t - f, self._embedding_dim)
             std = mean + 1
             fakez = torch.normal(mean=mean, std=std).to(self._device)
 
             condvec = self._noise.generate_noise_from_metadata(
-                batched_graphs=graph, batched_chain=chain, trigger_data=metadata,
-                tx_start_time=tx_start_time
+                batched_graphs=graph[f:t],
+                batched_chain=chain[f:t],
+                trigger_data=metadata[f:t] if metadata is not None else None,
+                tx_start_time=tx_start_time[f:t] if tx_start_time is not None else None
             )
 
             if condvec is None:
@@ -633,8 +661,8 @@ class CTGAN(BaseSynthesizer):
                 c1 = condvec
                 fakez = torch.cat([fakez, c1], dim=1)
 
-            fake = self._generator(fakez).unique(dim=0)
-            fakeact = self._apply_activate(fake).unique(dim=0)
+            fake = self._generator(fakez)
+            fakeact = self._apply_activate(fake)
             data.append(fakeact.detach().cpu().numpy())
 
         data = np.concatenate(data, axis=0)

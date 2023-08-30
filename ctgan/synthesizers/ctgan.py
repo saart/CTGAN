@@ -591,7 +591,7 @@ class CTGAN(BaseSynthesizer):
 
     # @random_state
     def sample_one(self, graph_index: int, chain_index: Optional[int],
-                   metadata: Optional[np.ndarray] = None,
+                   metadata: Optional[Union[pd.Series, pd.DataFrame]] = None,
                    tx_start_time: Optional[int] = None,
                    columns: Optional[List[str]] = None,
                    normalize_trigger_data: bool = True) -> pd.DataFrame:
@@ -601,11 +601,12 @@ class CTGAN(BaseSynthesizer):
         graph_index_list = [graph_index for _ in range(n)]
         chain_index_list = [chain_index or 0 for _ in range(n)]
         tx_start_time_list = [tx_start_time for _ in range(n)] if tx_start_time is not None else None
+        metadata_list: Optional[List[np.ndarray]] = None
         if metadata is not None:
-            metadata = metadata.repeat(n, axis=0)
+            metadata_list = metadata.values.repeat(n, axis=0)
         return self.sample(
             graph_index_list=graph_index_list, chain_index_list=chain_index_list,
-            metadata_list=metadata, tx_start_time_list=tx_start_time_list, columns=columns,
+            metadata_list=metadata_list, tx_start_time_list=tx_start_time_list, columns=columns,
             normalize_trigger_data=normalize_trigger_data
         )
 
@@ -634,7 +635,7 @@ class CTGAN(BaseSynthesizer):
         tx_start_time = torch.tensor(tx_start_time_list).type(torch.float32).to(self._device) if tx_start_time_list is not None else None
         if metadata_list is not None:
             if normalize_trigger_data:
-                metadata_list = [self._metadata_transformer.transform(m) for m in metadata_list]
+                metadata_list = self._metadata_transformer.transform(metadata_list)
             metadata = torch.from_numpy(metadata_list).type(torch.float32).to(self._device)
         else:
             assert self.metadata_dim == 0, "Most provide metadata in the metadata-based CTGAN"

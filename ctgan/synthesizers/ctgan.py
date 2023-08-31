@@ -1,7 +1,7 @@
 """CTGAN module."""
 
 import warnings
-from typing import NamedTuple, Union, Optional, List
+from typing import Union, Optional, List
 import numpy as np
 import pandas as pd
 import torch
@@ -11,13 +11,7 @@ import torch_geometric
 
 from ctgan.data_sampler import DataSampler
 from ctgan.data_transformer import DataTransformer
-from ctgan.synthesizers.base import BaseSynthesizer, random_state
-
-
-class Graph(NamedTuple):
-    graph_index: Union[int, str]
-    x: torch.Tensor
-    edge_index: torch.Tensor
+from ctgan.synthesizers.base import BaseSynthesizer
 
 
 class Noise(Module):
@@ -77,11 +71,8 @@ class Noise(Module):
     def generate_noise_from_indexes(self, idx: List[int]):
         chain = self.chain_data[idx]
         trigger_data = None if self.trigger_data is None else self.trigger_data[idx]
-        graph = None if self.graph_data is None else self.graph_data[idx]
+        graph = self.graph_data[idx]
         tx_start_time = self.tx_start_time[idx] if self.use_tx_time else None
-
-        graph = [Graph(graph_index.item(), torch.ones((self.n_nodes, 1)).to(self.device), self.graph_index_to_edges[graph_index.item()])
-                 for graph_index in graph]
 
         # TODO: Do we want to use the same layers for generator and discriminator?
         return self.generate_noise_from_metadata(
@@ -90,17 +81,20 @@ class Noise(Module):
         )
 
     def generate_noise_from_metadata(
-        self, trigger_data, batched_chain, batched_graphs: List[Graph], tx_start_time: torch.Tensor
+        self, trigger_data: Optional[torch.Tensor], batched_chain: torch.Tensor,
+        batched_graphs: torch.Tensor, tx_start_time: torch.Tensor
     ):
         if self.with_gcn:
-            unique_graphs = {graph.graph_index: graph for graph in batched_graphs}
-            unique_gcn = {graph.graph_index: self.gcn(graph.x, graph.edge_index).flatten().unsqueeze(0) for graph in
-                          unique_graphs.values()}
-            graph_embedding = torch.concatenate([unique_gcn[graph.graph_index] for graph in batched_graphs])
+            ones = torch.ones((self.n_nodes, 1)).to(self.device)
+            unique_gcn = {
+                int(graph): self.gcn(ones, self.graph_index_to_edges[int(graph)]).flatten().unsqueeze(0)
+                for graph in batched_graphs.unique()
+            }
+            graph_embedding = torch.concatenate([unique_gcn[int(graph)] for graph in batched_graphs])
         else:
             graph_embedding = torch.zeros((len(batched_graphs), self.graph_dim))
             for row_index, graph in enumerate(batched_graphs):
-                graph_embedding[row_index][int(graph.graph_index)] = 1
+                graph_embedding[row_index][int(graph)] = 1
 
         embed_to_noise = torch.cat(
             [graph_embedding, batched_chain.unsqueeze(1)]
@@ -598,9 +592,9 @@ class CTGAN(BaseSynthesizer):
         n = 2
         if n == 1:
             raise ValueError('n must be greater than 1')
-        graph_index_list = [graph_index for _ in range(n)]
-        chain_index_list = [chain_index or 0 for _ in range(n)]
-        tx_start_time_list = [tx_start_time for _ in range(n)] if tx_start_time is not None else None
+        graph_index_list = torch.Tensor([graph_index for _ in range(n)])
+        chain_index_list = torch.Tensor([chain_index or 0 for _ in range(n)])
+        tx_start_time_list = torch.Tensor([tx_start_time for _ in range(n)]) if tx_start_time is not None else None
         metadata_list: Optional[List[np.ndarray]] = None
         if metadata is not None:
             metadata_list = metadata.values.repeat(n, axis=0)
@@ -610,9 +604,9 @@ class CTGAN(BaseSynthesizer):
             normalize_trigger_data=normalize_trigger_data
         )
 
-    def sample(self, graph_index_list: List[int], chain_index_list: List[int],
+    def sample(self, graph_index_list: torch.Tensor, chain_index_list: torch.Tensor,
                metadata_list: Optional[List[np.ndarray]] = None,
-               tx_start_time_list: Optional[List[int]] = None,
+               tx_start_time_list: torch.Tensor = None,
                columns: Optional[List[str]] = None,
                normalize_trigger_data: bool = True) -> pd.DataFrame:
         """Sample data similar to the training data.
@@ -625,18 +619,14 @@ class CTGAN(BaseSynthesizer):
         """
         n = len(graph_index_list)
 
-        graph = [Graph(
-            x=torch.ones((self.n_nodes, 1)).to(self._device),
-            edge_index=self.graph_index_to_edges[graph_index].to(self._device),
-            graph_index=graph_index
-        ) for graph_index in graph_index_list]
+        graph = graph_index_list.to(self._device)
 
-        chain = torch.tensor(chain_index_list).type(torch.float32).to(self._device)
-        tx_start_time = torch.tensor(tx_start_time_list).type(torch.float32).to(self._device) if tx_start_time_list is not None else None
+        chain = chain_index_list.type(torch.float32).to(self._device)
+        tx_start_time = tx_start_time_list.type(torch.float32).to(self._device) if tx_start_time_list is not None else None
         if metadata_list is not None:
             if normalize_trigger_data:
-                metadata_list = self._metadata_transformer.transform(metadata_list)
-            metadata = torch.from_numpy(metadata_list).type(torch.float32).to(self._device)
+                metadata_list = torch.from_numpy(self._metadata_transformer.transform(metadata_list))
+            metadata = metadata_list.type(torch.float32).to(self._device)
         else:
             assert self.metadata_dim == 0, "Most provide metadata in the metadata-based CTGAN"
             metadata = None

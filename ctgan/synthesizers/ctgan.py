@@ -236,9 +236,11 @@ class CTGAN(BaseSynthesizer):
                  discriminator_decay=1e-6, batch_size=500, discriminator_steps=1,
                  log_frequency=True, verbose=False, epochs=300, pac=10, cuda=True,
                  graph_index_to_edges=None, n_nodes=32, functional_loss=None,
-                 functional_loss_freq=None, with_gcn=True, device: torch.device = None):
+                 functional_loss_freq=None, with_gcn=True, device: torch.device = None,
+                 name: str = 'ctgan'):
 
         assert batch_size % 2 == 0
+        self.name = name
 
         self._embedding_dim = embedding_dim
         self._generator_dim = generator_dim
@@ -470,7 +472,6 @@ class CTGAN(BaseSynthesizer):
         std = mean + 1
 
         steps_per_epoch = max(len(train_data) // self._batch_size, 1)
-        loss_g, loss_d = None, None
         for i in range(epochs):
             for id_ in range(steps_per_epoch):
 
@@ -559,9 +560,7 @@ class CTGAN(BaseSynthesizer):
                 optimizerG.step()
 
             if self._verbose:
-                print(f'Epoch {i+1}, Loss G: {loss_g.detach().cpu(): .4f},'  # noqa: T001
-                      f'Loss D: {loss_d.detach().cpu(): .4f}',
-                      flush=True)
+                print(f'{self.name}-{i+1},', end=' ', flush=True)
 
             if self.functional_loss_freq and self.functional_loss and (i+1) % self.functional_loss_freq == 0:
                 self.functional_loss(i)

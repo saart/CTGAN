@@ -1,4 +1,5 @@
 """CTGAN module."""
+import time
 
 import warnings
 from typing import Union, Optional, List
@@ -471,6 +472,7 @@ class CTGAN(BaseSynthesizer):
         mean = torch.zeros(self._batch_size, self._embedding_dim, device=self._device)
         std = mean + 1
 
+        start_time = time.time()
         steps_per_epoch = max(len(train_data) // self._batch_size, 1)
         for i in range(epochs):
             for id_ in range(steps_per_epoch):
@@ -564,6 +566,7 @@ class CTGAN(BaseSynthesizer):
 
             if self.functional_loss_freq and self.functional_loss and (i+1) % self.functional_loss_freq == 0:
                 self.functional_loss(i)
+        print(f'\n\n{self.name} _fit_for took {time.time() - start_time} seconds\n\n')
 
     def continue_fit(self, train_data, graph_data, chain_data, tx_start_time, metadata, discriminator, optimizerG, optimizerD):
         train_data = self._transformer.transform(train_data)

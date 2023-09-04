@@ -50,7 +50,7 @@ class Noise(Module):
                 self.graph_dim
                 + 1  # chain
                 + (32 if self.use_metadata else 0)
-                + (1 if self.use_tx_time else 0)
+                + (tx_start_time.shape[1] if self.use_tx_time else 0)
             ),
             noise_embedding_dim
         )
@@ -100,9 +100,9 @@ class Noise(Module):
         embed_to_noise = torch.cat(
             [graph_embedding, batched_chain.unsqueeze(1)]
             + ([self.triggering_layer(trigger_data)] if self.use_metadata else [])
-            + ([tx_start_time.unsqueeze(1)] if self.use_tx_time else []),
+            + ([tx_start_time] if self.use_tx_time else []),
             dim=1
-        )
+        ).float()
         return self.noise_embedding(embed_to_noise)
 
 
@@ -419,6 +419,13 @@ class CTGAN(BaseSynthesizer):
             self._metadata_transformer.fit(metadata, metadata_discrete_columns)
             metadata = self._metadata_transformer.transform(metadata)
 
+        self._start_time_transformer = DataTransformer()
+        if tx_start_time is not None:
+            if isinstance(tx_start_time, pd.Series):
+                tx_start_time = tx_start_time.to_frame()
+            self._start_time_transformer.fit(tx_start_time)
+            tx_start_time = self._start_time_transformer.transform(tx_start_time)
+
         self._data_sampler = DataSampler(
             train_data,
             self._transformer.output_info_list,
@@ -437,7 +444,7 @@ class CTGAN(BaseSynthesizer):
             graph_data=torch.Tensor(graph_data.values).to(self._device),
             chain_data=torch.Tensor(chain_data.values).to(self._device),
             trigger_data=torch.from_numpy(metadata).type(torch.float32).to(self._device) if metadata is not None else None,
-            tx_start_time=torch.Tensor(tx_start_time.values).to(self._device) if tx_start_time is not None else None,
+            tx_start_time=torch.from_numpy(tx_start_time).to(self._device) if tx_start_time is not None else None,
         ).to(self._device)
 
         self._generator = Generator(
@@ -572,11 +579,13 @@ class CTGAN(BaseSynthesizer):
         train_data = self._transformer.transform(train_data)
         if metadata is not None:
             metadata = self._metadata_transformer.transform(metadata)
+        if tx_start_time is not None:
+            tx_start_time = self._start_time_transformer.transform(tx_start_time)
 
         self._noise.graph_data = torch.Tensor(graph_data.values).to(self._device)
         self._noise.chain_data = torch.Tensor(chain_data.values).to(self._device)
         self._noise.trigger_data = torch.from_numpy(metadata).type(torch.float32).to(self._device) if metadata is not None else None
-        self._noise.tx_start_time = torch.Tensor(tx_start_time.values).to(self._device) if tx_start_time is not None else None
+        self._noise.tx_start_time = torch.from_numpy(tx_start_time).type(torch.float32).to(self._device) if tx_start_time is not None else None
 
         self._data_sampler = DataSampler(
             train_data,
@@ -608,7 +617,7 @@ class CTGAN(BaseSynthesizer):
 
     def sample(self, graph_index_list: torch.Tensor, chain_index_list: torch.Tensor,
                metadata_list: Optional[List[np.ndarray]] = None,
-               tx_start_time_list: torch.Tensor = None,
+               tx_start_time_list: Optional[pd.DataFrame] = None,
                columns: Optional[List[str]] = None,
                normalize_trigger_data: bool = True) -> pd.DataFrame:
         """Sample data similar to the training data.
@@ -624,7 +633,7 @@ class CTGAN(BaseSynthesizer):
         graph = graph_index_list.to(self._device)
 
         chain = chain_index_list.type(torch.float32).to(self._device)
-        tx_start_time = tx_start_time_list.type(torch.float32).to(self._device) if tx_start_time_list is not None else None
+        tx_start_time = tx_start_time_list if tx_start_time_list is not None else None
         if metadata_list is not None:
             if normalize_trigger_data:
                 metadata_list = torch.from_numpy(self._metadata_transformer.transform(metadata_list))
@@ -632,6 +641,11 @@ class CTGAN(BaseSynthesizer):
         else:
             assert self.metadata_dim == 0, "Most provide metadata in the metadata-based CTGAN"
             metadata = None
+
+        if tx_start_time is not None:
+            if normalize_trigger_data:
+                tx_start_time = torch.from_numpy(self._start_time_transformer.transform(tx_start_time))
+            tx_start_time = tx_start_time.type(torch.float32).to(self._device)
 
         steps = (n-1) // self._batch_size + 1
         data = []

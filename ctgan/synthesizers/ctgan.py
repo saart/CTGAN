@@ -649,8 +649,12 @@ class CTGAN(BaseSynthesizer):
 
         steps = (n-1) // self._batch_size + 1
         data = []
+        plus_one = False
         for i in range(steps):
             f, t = i * self._batch_size, min((i + 1) * self._batch_size, n)
+            if t - f == 1:
+                plus_one = True
+                f -= 1
             mean = torch.zeros(t - f, self._embedding_dim)
             std = mean + 1
             fakez = torch.normal(mean=mean, std=std).to(self._device)
@@ -670,6 +674,8 @@ class CTGAN(BaseSynthesizer):
 
             fake = self._generator(fakez)
             fakeact = self._apply_activate(fake)
+            if plus_one:
+                fakeact = fakeact[1:]
             data.append(fakeact.detach().cpu().numpy())
 
         data = np.concatenate(data, axis=0)

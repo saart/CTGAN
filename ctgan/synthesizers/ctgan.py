@@ -580,6 +580,8 @@ class CTGAN(BaseSynthesizer):
         if metadata is not None:
             metadata = self._metadata_transformer.transform(metadata)
         if tx_start_time is not None:
+            if isinstance(tx_start_time, pd.Series):
+                tx_start_time = tx_start_time.to_frame()
             tx_start_time = self._start_time_transformer.transform(tx_start_time)
 
         self._noise.graph_data = torch.Tensor(graph_data.values).to(self._device)

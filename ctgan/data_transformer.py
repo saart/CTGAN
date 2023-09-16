@@ -199,7 +199,7 @@ class DataTransformer(object):
         data = pd.DataFrame(column_data, columns=list(ohe.get_output_sdtypes()))
         return ohe.reverse_transform(data)[column_transform_info.column_name]
 
-    def inverse_transform(self, data, sigmas=None):
+    def inverse_transform(self, data, sigmas=None, columns=None):
         """Take matrix data and output raw data.
 
         Output uses the same type as input to the transform function.
@@ -210,6 +210,9 @@ class DataTransformer(object):
         column_names = []
         for column_transform_info in self._column_transform_info_list:
             dim = column_transform_info.output_dimensions
+            if columns is not None and column_transform_info.column_name not in columns:
+                st += dim
+                continue
             column_data = data[:, st:st + dim]
             if column_transform_info.column_type == 'continuous':
                 recovered_column_data = self._inverse_transform_continuous(
@@ -223,8 +226,9 @@ class DataTransformer(object):
             st += dim
 
         recovered_data = np.column_stack(recovered_column_data_list)
+        raw_types = {k: v for k, v in self._column_raw_dtypes.items() if k in column_names}
         recovered_data = (pd.DataFrame(recovered_data, columns=column_names)
-                          .astype(self._column_raw_dtypes))
+                          .astype(raw_types))
         if not self.dataframe:
             recovered_data = recovered_data.to_numpy()
 

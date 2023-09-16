@@ -1,4 +1,6 @@
 """DataSampler module."""
+from collections import Counter
+from typing import List
 
 import numpy as np
 
@@ -127,7 +129,7 @@ class DataSampler(object):
 
         return cond
 
-    def sample_data(self, n, col, opt):
+    def sample_data(self, n, col, opt) -> List[int]:
         """Sample data from original training data satisfying the sampled conditional vector.
 
         Returns:
@@ -135,13 +137,14 @@ class DataSampler(object):
         """
         if col is None:
             idx = np.random.randint(len(self._data), size=n)
-            return self._data[idx]
+            return [idx]
 
         idx = []
-        for c, o in zip(col, opt):
-            idx.append(np.random.choice(self._rid_by_cat_cols[c][o]))
 
-        return self._data[idx]
+        for (c, o), count in Counter(zip(col, opt)).items():
+            idx.extend(np.random.choice(self._rid_by_cat_cols[c][o], count))
+
+        return idx
 
     def dim_cond_vec(self):
         """Return the total number of categories."""
